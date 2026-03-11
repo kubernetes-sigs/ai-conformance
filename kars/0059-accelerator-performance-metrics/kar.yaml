@@ -1,0 +1,31 @@
+title: "Accelerator Performance Metrics"
+kar-number: 59
+participating-sigs:
+  - sig-architecture
+  - sig-instrumentation
+  - sig-node
+# The current status of this KAR. 
+# Implementable: Part of a Kubernetes release as a SHOULD or MUST, implementation is ongoing.
+# Implemented: Has been part of one or more Kubernetes releases and has graduated to MUST. 
+# Implementation is complete. Further changes should be made via new KARs.
+status: implemented
+creation-date: "2026-03-12"
+
+# see-also:
+#   - "/kars/1234-another-kar"
+# replaces:
+#   - "/kars/3456-replaced-kar"
+
+# The target maturity stage in the current dev cycle for this KAR.
+# If the purpose of this KAR is to deprecate an existing requirement
+# then they should be deprecated|disabled|removed.
+stage: must
+
+# The most recent milestone for which work toward delivery of this KAR has been
+# done. This can be the current (upcoming) milestone, if it is being actively
+# worked on.
+latest-milestone: "v1.33"
+
+# The milestone at which this feature was, or is targeted to be, at each stage.
+milestone:
+  must: "v1.33"
