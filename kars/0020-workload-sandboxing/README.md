@@ -41,13 +41,15 @@ Validate the following observable outcomes by configuring a sandboxed `RuntimeCl
 
 ### Automated Tests
 
-An automated conformance test could verify the observable outcomes above:
-1. Leverage standard `RuntimeClass` definitions (or a configurable sandboxed runtime handler) to dynamically provision a sandboxed test pod.
-1. Execute verification scripts within the test pod to confirm process, memory, filesystem, and network isolation from the host node (e.g., verifying distinct kernel versions, namespace separation, blocked host mounts, and restricted egress).
-1. If a platform employs a specialized or unrecognized sandboxing mechanism that cannot be automatically verified, the test suite will output an "Unknown" status, signaling that manual attestation is required.
+The automated conformance test (`TestWorkloadSandboxing`) in `test/workload_sandboxing_test.go` verifies the observable outcomes above:
+1. Detects or accepts a sandboxed runtime solution (standard Kubernetes `RuntimeClass` such as `gvisor` or `kata`, or a sandboxing controller such as [`agent-sandbox`](https://github.com/kubernetes-sigs/agent-sandbox)).
+2. Provisions a verification workload with the sandboxed runtime and executes probing checks confirming process, memory, filesystem, and network isolation from the host node.
+3. Runs the same probe in an unsandboxed control pod pinned to the node the sandboxed workload landed on, and requires the sandboxed workload to observe a distinct kernel identity (kernel release, `/proc/version`, boot ID). A plain container passes the isolation probes on its own because it already has its own namespaces; only a runtime with a kernel boundary (a user-space kernel such as gVisor, or a microVM guest kernel such as Kata) reports a kernel distinct from the host.
+4. If a platform employs a specialized or unrecognized sandboxing mechanism, the test can be pointed at it with `-sandbox-runtime-class=<name>`; if no mechanism is detected and none is specified, the test is skipped with guidance for manual attestation.
 
 ## Implementation History
 
-2026-05-20: KAR created
+- 2026-05-20: KAR created
+- 2026-09-24: Automated conformance test `TestWorkloadSandboxing` added to the test suite
 
 ## Related KARs

@@ -32,6 +32,11 @@ GCE_IMAGE_PROJECT="${GCE_IMAGE_PROJECT:-deeplearning-platform-release}"
 K8S_VERSION="${K8S_VERSION:-v1.35.0}"
 GPU_OPERATOR_VERSION="${GPU_OPERATOR_VERSION:-v26.3.1}"
 GANG_SCHEDULER="${GANG_SCHEDULER:-kueue}"
+# gVisor (runsc) is baked into the kind node image so TestWorkloadSandboxing
+# has a sandboxed RuntimeClass to exercise. Kata is not an option here: GCE
+# does not offer nested virtualization on VMs with attached GPUs.
+GVISOR_RELEASE_URL="${GVISOR_RELEASE_URL:-https://storage.googleapis.com/gvisor/releases/release/latest/x86_64}"
+KIND_NODE_IMAGE="kindest/node-gvisor:${K8S_VERSION}"
 BUILD_ID="${BUILD_ID:-$(date +%s)}"
 VM_NAME="ai-conformance-e2e-${BUILD_ID}"
 
@@ -160,7 +165,7 @@ set -euo pipefail
 
 echo "Installing Docker & NVIDIA Container Toolkit..."
 sudo apt-get update -qq
-sudo apt-get install -y -qq ca-certificates curl gnupg make build-essential git jq docker.io
+sudo apt-get install -y -qq ca-certificates curl gnupg make build-essential git jq docker.io zstd
 
 if ! command -v nvidia-ctk >/dev/null 2>&1; then
   curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey |
@@ -198,6 +203,26 @@ go install github.com/NVIDIA/nvkind/cmd/nvkind@latest
 go install sigs.k8s.io/kind@latest
 export PATH="\${HOME}/go/bin:\${PATH}"
 
+echo "Building kind node image ${KIND_NODE_IMAGE} with gVisor (runsc, systrap platform)..."
+mkdir -p /tmp/kind-gvisor/gvisor
+pushd /tmp/kind-gvisor
+wget -q "${GVISOR_RELEASE_URL}/gvisor.tar.zstd" "${GVISOR_RELEASE_URL}/gvisor.tar.zstd.sha512"
+sha512sum -c gvisor.tar.zstd.sha512
+tar --zstd -xf gvisor.tar.zstd -C gvisor
+cat <<'EOF' > runsc.toml
+[runsc_config]
+# systrap needs no KVM, so it works inside a kind node container on a VM.
+platform = "systrap"
+EOF
+cat <<EOF > Dockerfile
+FROM kindest/node:${K8S_VERSION}
+# runsc, containerd-shim-runsc-v1 and gvisor-bin/ must stay together.
+COPY gvisor/ /usr/local/bin/
+COPY runsc.toml /etc/containerd/runsc.toml
+EOF
+sudo docker build -t "${KIND_NODE_IMAGE}" .
+popd
+
 cat <<'EOF' > /tmp/nvkind-config.yaml.tmpl
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
@@ -207,6 +232,11 @@ containerdConfigPatches:
 - |-
   [plugins."io.containerd.grpc.v1.cri"]
     enable_cdi = true
+  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runsc]
+    runtime_type = "io.containerd.runsc.v1"
+  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runsc.options]
+    TypeUrl = "io.containerd.runsc.v1.options"
+    ConfigPath = "/etc/containerd/runsc.toml"
 nodes:
 - role: control-plane
   kubeadmConfigPatches:
@@ -243,11 +273,21 @@ EOF
 echo "Creating nvkind cluster (DRA enabled)..."
 sudo -E env PATH="\${PATH}" nvkind cluster create \
     --name ai-conformance-cluster \
-    --image "kindest/node:${K8S_VERSION}" \
+    --image "${KIND_NODE_IMAGE}" \
     --config-template /tmp/nvkind-config.yaml.tmpl
 
 kubectl wait --for=condition=Ready nodes --all --timeout=300s
 kubectl label node --all nvidia.com/gpu.present=true feature.node.kubernetes.io/pci-10de.present=true --overwrite
+
+echo "Registering gVisor RuntimeClass..."
+cat <<EOF | kubectl apply -f -
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gvisor
+handler: runsc
+EOF
+kubectl get runtimeclass
 
 echo "nvkind cluster GPUs:"
 sudo -E env PATH="\${PATH}" nvkind cluster print-gpus --name ai-conformance-cluster || true
@@ -351,6 +391,7 @@ go test -v ./test/... \
     -allocation-mode=auto \
     -gang-scheduler-namespace=ai-conformance-gang-scheduling \
     -gang-job-labels="kueue.x-k8s.io/queue-name=e2e-lq" \
+    -sandbox-runtime-class=gvisor \
     -json | tee _artifacts/results.json
 REMOTE_TEST
 

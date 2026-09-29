@@ -20,6 +20,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	nodeutil "k8s.io/component-helpers/node/util"
 	"k8s.io/component-helpers/scheduling/corev1/nodeaffinity"
@@ -93,9 +94,9 @@ func init() {
 		"Duration to observe the negative gang scheduling test job to verify no pods are partially scheduled.")
 }
 
-// getClientset creates a Kubernetes clientset using the kubeconfig flag.
+// getRESTConfig loads the client config from the kubeconfig flag.
 // Shared helper to avoid duplicating kubeconfig loading across test files.
-func getClientset(t *testing.T) kubernetes.Interface {
+func getRESTConfig(t *testing.T) *rest.Config {
 	t.Helper()
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	if *kubeconfig != "" {
@@ -105,7 +106,13 @@ func getClientset(t *testing.T) kubernetes.Interface {
 	if err != nil {
 		t.Fatalf("Error building kubeconfig: %v", err)
 	}
-	clientset, err := kubernetes.NewForConfig(config)
+	return config
+}
+
+// getClientset creates a Kubernetes clientset using the kubeconfig flag.
+func getClientset(t *testing.T) kubernetes.Interface {
+	t.Helper()
+	clientset, err := kubernetes.NewForConfig(getRESTConfig(t))
 	if err != nil {
 		t.Fatalf("Error creating kubernetes client: %v", err)
 	}
