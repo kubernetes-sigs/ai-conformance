@@ -31,6 +31,7 @@ GCE_IMAGE_FAMILY="${GCE_IMAGE_FAMILY:-common-cu129-ubuntu-2404-nvidia-580}"
 GCE_IMAGE_PROJECT="${GCE_IMAGE_PROJECT:-deeplearning-platform-release}"
 K8S_VERSION="${K8S_VERSION:-v1.35.0}"
 GPU_OPERATOR_VERSION="${GPU_OPERATOR_VERSION:-v26.3.1}"
+KUBEFLOW_TRAINER_VERSION="${KUBEFLOW_TRAINER_VERSION:-2.3.0}"
 GANG_SCHEDULER="${GANG_SCHEDULER:-kueue}"
 BUILD_ID="${BUILD_ID:-$(date +%s)}"
 VM_NAME="ai-conformance-e2e-${BUILD_ID}"
@@ -255,7 +256,7 @@ kubectl get nodes -o wide
 REMOTE_SCRIPT
 
 echo "================================================================"
-echo "3. Deploying Cluster Prerequisites (NVIDIA DRA Driver & Kueue)"
+echo "3. Deploying Cluster Prerequisites (NVIDIA DRA Driver, Gang Scheduler & AI Operator)"
 echo "================================================================"
 gcloud compute ssh "${VM_NAME}" --project="${GCP_PROJECT}" --zone="${GCE_ZONE}" --command="bash -s" <<REMOTE_STACK
 set -euo pipefail
@@ -332,6 +333,19 @@ EOF
   echo "Waiting for ClusterQueue to be active..."
   kubectl wait --for=condition=Active clusterqueue/e2e-cq --timeout=60s
 fi
+
+echo "Installing Kubeflow Trainer (AI Operator for KAR-0063)..."
+helm upgrade -i kubeflow-trainer oci://ghcr.io/kubeflow/charts/kubeflow-trainer \
+    --namespace kubeflow-system \
+    --create-namespace \
+    --version "${KUBEFLOW_TRAINER_VERSION}" \
+    --set runtimes.defaultEnabled=true \
+    --wait --timeout 5m
+
+echo "Verifying Kubeflow Trainer CRDs and default runtimes..."
+kubectl get crd trainjobs.trainer.kubeflow.org
+kubectl get clustertrainingruntime torch-distributed
+kubectl rollout status deployment -n kubeflow-system kubeflow-trainer-controller-manager --timeout=5m
 
 REMOTE_STACK
 

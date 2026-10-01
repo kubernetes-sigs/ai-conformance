@@ -42,6 +42,7 @@ The test verifies that a representative AI operator with a CRD can be installed,
 ## Implementation History
 
 2026-03-12: KAR created
+2026-09-15: Automated conformance test added in test/crd_controller_test.go
 
 ## Related KARs
 

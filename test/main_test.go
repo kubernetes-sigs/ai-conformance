@@ -13,7 +13,7 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "Usage of Kubernetes AI Conformance tests:\n\n")
 		fmt.Fprintf(os.Stderr, "These tests require specific flags depending on the capability being tested.\n\n")
 
-		var globalFlags, autoscalerFlags, gangFlags, goTestFlags []*flag.Flag
+		var globalFlags, autoscalerFlags, gangFlags, operatorFlags, goTestFlags []*flag.Flag
 
 		flag.VisitAll(func(f *flag.Flag) {
 			if strings.HasPrefix(f.Name, "test.") {
@@ -22,6 +22,8 @@ func TestMain(m *testing.M) {
 				autoscalerFlags = append(autoscalerFlags, f)
 			} else if strings.HasPrefix(f.Name, "gang-") {
 				gangFlags = append(gangFlags, f)
+			} else if f.Name == "operator" || strings.HasPrefix(f.Name, "operator-") {
+				operatorFlags = append(operatorFlags, f)
 			} else {
 				globalFlags = append(globalFlags, f)
 			}
@@ -51,6 +53,7 @@ func TestMain(m *testing.M) {
 		printFlags("Global Suite Flags (Apply to all tests)", globalFlags)
 		printFlags("Accelerator Cluster Autoscaling Flags (TestAcceleratorClusterAutoscaling)", autoscalerFlags)
 		printFlags("Gang Scheduling Flags (TestGangScheduling)", gangFlags)
+		printFlags("Robust CRD Controller Flags (TestRobustCRDControllerOperation)", operatorFlags)
 
 		fmt.Fprintf(os.Stderr, "Standard Go Test Flags (e.g. -v, -run, -timeout, -short):\n")
 		fmt.Fprintf(os.Stderr, "  Run 'go help testflag' for detailed documentation of standard flags.\n")

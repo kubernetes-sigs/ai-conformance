@@ -33,6 +33,7 @@ go test -v -short ./test
 | `TestSecureAcceleratorAccess` | Secure Accelerator Access | MUST |
 | `TestGangScheduling` | Gang Scheduling | MUST |
 | `TestAcceleratorClusterAutoscaling` | Effective Cluster Autoscaling for Accelerators | MUST |
+| `TestRobustCRDControllerOperation` | Robust CRD and Controller Operation | MUST |
 
 ### Accelerator Cluster Autoscaling
 

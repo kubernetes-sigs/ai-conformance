@@ -19,7 +19,9 @@ import (
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	nodeutil "k8s.io/component-helpers/node/util"
 	"k8s.io/component-helpers/scheduling/corev1/nodeaffinity"
@@ -93,9 +95,9 @@ func init() {
 		"Duration to observe the negative gang scheduling test job to verify no pods are partially scheduled.")
 }
 
-// getClientset creates a Kubernetes clientset using the kubeconfig flag.
-// Shared helper to avoid duplicating kubeconfig loading across test files.
-func getClientset(t *testing.T) kubernetes.Interface {
+// buildRESTConfig loads a *rest.Config from the kubeconfig flag. Shared by
+// getClientset and getDynamicClient to avoid duplicating kubeconfig loading.
+func buildRESTConfig(t *testing.T) *rest.Config {
 	t.Helper()
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	if *kubeconfig != "" {
@@ -105,11 +107,27 @@ func getClientset(t *testing.T) kubernetes.Interface {
 	if err != nil {
 		t.Fatalf("Error building kubeconfig: %v", err)
 	}
-	clientset, err := kubernetes.NewForConfig(config)
+	return config
+}
+
+// getClientset creates a Kubernetes clientset using the kubeconfig flag.
+func getClientset(t *testing.T) kubernetes.Interface {
+	t.Helper()
+	clientset, err := kubernetes.NewForConfig(buildRESTConfig(t))
 	if err != nil {
 		t.Fatalf("Error creating kubernetes client: %v", err)
 	}
 	return clientset
+}
+
+// getDynamicClient creates a Kubernetes dynamic client using the kubeconfig flag.
+func getDynamicClient(t *testing.T) dynamic.Interface {
+	t.Helper()
+	dynamicClient, err := dynamic.NewForConfig(buildRESTConfig(t))
+	if err != nil {
+		t.Fatalf("Error creating dynamic client: %v", err)
+	}
+	return dynamicClient
 }
 
 func deleteNamespaceAndWait(ctx context.Context, t *testing.T, c kubernetes.Interface, namespace string) error {
