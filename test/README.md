@@ -5,6 +5,7 @@ To run these AI Conformance tests, you must have:
 - Kubeconfig: A valid kubeconfig file with cluster-admin permissions for the target cluster.
 - Accelerator Node Pool: The cluster must have nodes with accelerators exposed through the Kubernetes resource management framework — either a DRA driver (ResourceClaims against a DeviceClass such as `gpu.nvidia.com`) or a device plugin (extended resources such as `nvidia.com/gpu`). Make sure your nodes allow testing pods to be scheduled on them (e.g. no taints that prevent scheduling).
 - Cluster Autoscaling Test: `TestAcceleratorClusterAutoscaling` additionally requires a running cluster autoscaler and an isolated accelerator pool with minimum size `N >= 1`, maximum size at least `N+1`, effective capacity for exactly one requested accelerator per baseline node, scale-down enabled, sufficient cloud quota/stock, and one stable node label inherited by new pool nodes. The pool must contain no non-DaemonSet workloads or other Pending Pods explicitly selecting the pool. Device-plugin mode permits unrelated running accelerator workloads outside the pool but rejects other Pending Pods requesting the configured extended resource. DRA mode requires no other active Pods with ResourceClaims or allocated ResourceClaims outside the test namespace while the test runs because DRA devices may use shared topology.
+- Driver & Runtime Test: `TestAcceleratorDriverRuntimeManagement` additionally pulls a vanilla container image (`ubuntu:22.04` by default; override with `-driver-runtime-image` for air-gapped registries) and expects the platform's container runtime configuration to inject the accelerator vendor's tools (`nvidia-smi` for NVIDIA) into accelerator workloads.
 - Network Access: The test machine must be able to reach the Kubernetes API server.
 
 ## Running the Tests
@@ -30,9 +31,21 @@ go test -v -short ./test
 
 | Test Name | Requirement Covered | Requirement Level |
 |-|-|-|
+| `TestAcceleratorDriverRuntimeManagement` | Accelerator Driver & Runtime Management | SHOULD |
 | `TestSecureAcceleratorAccess` | Secure Accelerator Access | MUST |
 | `TestGangScheduling` | Gang Scheduling | MUST |
 | `TestAcceleratorClusterAutoscaling` | Effective Cluster Autoscaling for Accelerators | MUST |
+
+### Accelerator Driver & Runtime Management
+
+`TestAcceleratorDriverRuntimeManagement` verifies KAR-0001 (`driver_runtime_management`) on the accelerator node resolved by allocation-mode detection and on the node its probe Pod lands on:
+
+1. `VerifiableMechanismExposed`: resolves what the platform advertises about the accelerator driver on the node. DRA `ResourceSlice` device attributes are preferred in every allocation mode (for NVIDIA: `driverVersion` and `cudaDriverVersion`); Node labels or annotations are the fallback (for NVIDIA: the GPU Feature Discovery labels `nvidia.com/cuda.driver-version.full` and `nvidia.com/cuda.runtime-version.full`). It also records the node's `status.nodeInfo.containerRuntimeVersion`, the accelerator presence label, and the accelerator `RuntimeClass`. Missing version metadata is logged as a `WARNING` and does not fail the subtest; a node that reports no container runtime does.
+2. `DriverAndRuntimeCompatibility`: runs an accelerator-requesting Pod built from a vanilla image (`ubuntu:22.04` by default; `-driver-runtime-image` overrides it) and requires that the container sees exactly the requested accelerator devices, that the container runtime configuration (CDI spec or runtime hook) injected the vendor tools (`RUNTIME_CONFIG_OK`), that the driver initializes and reports a version (`DRIVER_FUNCTIONAL`), and that the observed driver and runtime versions match whatever the platform advertises. Versions are compared at the precision they share (`580.65.6` matches `580.65.06`, `12.9.0` matches `12.9`).
+
+"Runtime version" here is the accelerator runtime API version supported by the installed driver (the CUDA driver API version for NVIDIA); the container runtime configuration itself is verified by the injection check. The check is point-in-time: it confirms that the platform's mechanism reflects what is installed on the node during the run.
+
+If `-accelerator-type` names a variant the suite does not recognize, the test logs `RESULT: STATUS=UNKNOWN` and skips instead of failing (KAR-0001 Conformance Strategy). Provide manual verification evidence for the requirement in that case.
 
 ### Accelerator Cluster Autoscaling
 

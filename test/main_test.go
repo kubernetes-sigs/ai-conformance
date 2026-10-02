@@ -13,11 +13,13 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "Usage of Kubernetes AI Conformance tests:\n\n")
 		fmt.Fprintf(os.Stderr, "These tests require specific flags depending on the capability being tested.\n\n")
 
-		var globalFlags, autoscalerFlags, gangFlags, goTestFlags []*flag.Flag
+		var globalFlags, driverRuntimeFlags, autoscalerFlags, gangFlags, goTestFlags []*flag.Flag
 
 		flag.VisitAll(func(f *flag.Flag) {
 			if strings.HasPrefix(f.Name, "test.") {
 				goTestFlags = append(goTestFlags, f)
+			} else if strings.HasPrefix(f.Name, "driver-runtime-") {
+				driverRuntimeFlags = append(driverRuntimeFlags, f)
 			} else if strings.HasPrefix(f.Name, "autoscaler-") {
 				autoscalerFlags = append(autoscalerFlags, f)
 			} else if strings.HasPrefix(f.Name, "gang-") {
@@ -49,6 +51,7 @@ func TestMain(m *testing.M) {
 		}
 
 		printFlags("Global Suite Flags (Apply to all tests)", globalFlags)
+		printFlags("Accelerator Driver & Runtime Management Flags (TestAcceleratorDriverRuntimeManagement)", driverRuntimeFlags)
 		printFlags("Accelerator Cluster Autoscaling Flags (TestAcceleratorClusterAutoscaling)", autoscalerFlags)
 		printFlags("Gang Scheduling Flags (TestGangScheduling)", gangFlags)
 
