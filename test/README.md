@@ -5,6 +5,7 @@ To run these AI Conformance tests, you must have:
 - Kubeconfig: A valid kubeconfig file with cluster-admin permissions for the target cluster.
 - Accelerator Node Pool: The cluster must have nodes with accelerators exposed through the Kubernetes resource management framework — either a DRA driver (ResourceClaims against a DeviceClass such as `gpu.nvidia.com`) or a device plugin (extended resources such as `nvidia.com/gpu`). Make sure your nodes allow testing pods to be scheduled on them (e.g. no taints that prevent scheduling).
 - Cluster Autoscaling Test: `TestAcceleratorClusterAutoscaling` additionally requires a running cluster autoscaler and an isolated accelerator pool with minimum size `N >= 1`, maximum size at least `N+1`, effective capacity for exactly one requested accelerator per baseline node, scale-down enabled, sufficient cloud quota/stock, and one stable node label inherited by new pool nodes. The pool must contain no non-DaemonSet workloads or other Pending Pods explicitly selecting the pool. Device-plugin mode permits unrelated running accelerator workloads outside the pool but rejects other Pending Pods requesting the configured extended resource. DRA mode requires no other active Pods with ResourceClaims or allocated ResourceClaims outside the test namespace while the test runs because DRA devices may use shared topology.
+- Workload Sandboxing Test: `TestWorkloadSandboxing` requires a sandboxed `RuntimeClass` (e.g. gVisor or Kata Containers) or the [`agent-sandbox`](https://github.com/kubernetes-sigs/agent-sandbox) API, and is skipped if neither is detected. The node that runs the sandboxed workload must also admit a plain, unsandboxed pod pinned to it (the test's control pod).
 - Network Access: The test machine must be able to reach the Kubernetes API server.
 
 ## Running the Tests
@@ -34,6 +35,38 @@ go test -v -short ./test
 | `TestGangScheduling` | Gang Scheduling | MUST |
 | `TestAcceleratorClusterAutoscaling` | Effective Cluster Autoscaling for Accelerators | MUST |
 | `TestRobustCRDControllerOperation` | Robust CRD and Controller Operation | MUST |
+| `TestWorkloadSandboxing` | Workload Sandboxing for Untrusted Code | SHOULD |
+
+### Workload Sandboxing
+
+The workload sandboxing test (`TestWorkloadSandboxing`) verifies that the platform provides a sandboxing mechanism (such as standard Kubernetes `RuntimeClass` resources like `gvisor`, `kata`, or controllers like [`kubernetes-sigs/agent-sandbox`](https://github.com/kubernetes-sigs/agent-sandbox)) that isolates untrusted workload execution from the host node kernel, process, memory, filesystem, and network namespaces.
+
+The test defaults to auto-detection (`-sandbox-type=auto`):
+1. If `-sandbox-runtime-class` is provided, it verifies and uses that `RuntimeClass`.
+2. Otherwise, it detects available sandboxed `RuntimeClass` objects (e.g., `gvisor`, `runsc`, `kata`, `sandboxed`, `quark`, `krun`) or the `agents.x-k8s.io` API group.
+3. If no sandboxing mechanism is detected and no flag is set, the test is skipped with guidance on configuring flags or opting out if the capability is N/A.
+
+To run with an explicit RuntimeClass:
+```bash
+go test -v ./test \
+  -run TestWorkloadSandboxing \
+  -sandbox-runtime-class=gvisor
+```
+
+To run with agent-sandbox (`-sandbox-runtime-class` selects the RuntimeClass the Sandbox's Pod runs with; agent-sandbox orchestrates Pods and relies on the runtime handler for kernel isolation):
+```bash
+go test -v ./test \
+  -run TestWorkloadSandboxing \
+  -sandbox-type=agent-sandbox \
+  -sandbox-runtime-class=gvisor
+```
+
+The test runs a probe script in the sandboxed workload and then runs the same script in an unsandboxed control pod pinned to the node the sandboxed workload landed on. The subtests verify observable isolation boundaries:
+- `SchedulingAndExecution`: The sandboxed workload schedules, and the probe runs to completion inside the sandbox runtime.
+- `ProcessIsolation`: Host processes (e.g., `kubelet`, `containerd`) are not visible and the PID namespace is strictly container-scoped.
+- `KernelAndMemoryIsolation`: Host physical/kernel memory access (`/dev/mem`, `/dev/kmem`) is restricted, and the sandboxed workload observes a kernel identity (kernel release, `/proc/version`, boot ID) distinct from the control pod on the same node. A plain container shares the host kernel identity; a user-space kernel (gVisor) or microVM guest kernel (Kata) does not.
+- `FilesystemIsolation`: Host filesystem paths are not mounted into the sandbox.
+- `NetworkIsolation`: The sandboxed workload is restricted to its own network namespace, with no host bridge or CNI interfaces visible.
 
 ### Accelerator Cluster Autoscaling
 
