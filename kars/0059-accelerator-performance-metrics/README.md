@@ -17,7 +17,7 @@ Standardizing the metrics format and ensuring at least one solution is operation
 - [ ] Starting v1.37, new SHOULDs must include proposed automated tests in the automated tests section below
 
 **MUST**
-- [ ] Starting v1.37, new MUSTs must include automated tests that have been added to the AI conformance test suite
+- [x] Starting v1.37, new MUSTs must include automated tests that have been added to the AI conformance test suite
 - [x] Demonstrate at least two real-world usage of SHOULD before graduating to MUST
 - [x] Kubernetes core APIs must be GA
 
@@ -42,6 +42,7 @@ The test verifies that an accelerator metrics solution running on the platform e
 ## Implementation History
 
 2026-03-12: KAR created
+2026-10-07: Automated conformance tests added (`TestAcceleratorPerformanceMetrics`)
 
 ## Related KARs
 
