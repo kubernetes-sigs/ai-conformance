@@ -18,10 +18,10 @@ By providing a verifiable mechanism to ensure compatibility, platforms can signi
 
 **SHOULD**
 - [x] Describe how users can test it for self-attestation with scripts, documentation, etc
-- [ ] Starting v1.37, new SHOULDs must include proposed automated tests in the automated tests section below
+- [x] Starting v1.37, new SHOULDs must include proposed automated tests in the automated tests section below
 
 **MUST**
-- [ ] Starting v1.37, new MUSTs must include automated tests that have been added to the AI conformance test suite
+- [x] Starting v1.37, new MUSTs must include automated tests that have been added to the AI conformance test suite
 - [ ] Demonstrate at least two real-world usage of SHOULD before graduating to MUST
 - [ ] Kubernetes core APIs must be GA
 
@@ -33,13 +33,15 @@ We should be able to use the verifiable mechanism provided by the platform to en
 
 ### Automated Tests
 
-An automated test could involve deploying a pod to a node with a specific accelerator type. The pod would execute a script that inspects the node's environment to determine the actual installed driver and runtime versions. This should be compared to the versions provided by verifiable mechanism provided by the platform to confirm the mechanism reflects the actual state.
+This is implemented by `TestAcceleratorDriverRuntimeManagement` in the AI conformance test suite (see [test/driver_runtime_management_test.go](../../test/driver_runtime_management_test.go)). The test first resolves what the platform advertises about the accelerator driver on an accelerator node, preferring DRA `ResourceSlice` device attributes and falling back to Node labels or annotations. It then deploys an accelerator-requesting Pod built from a vanilla OS image; the Pod's script verifies that the container runtime configuration injected the vendor's driver tools and libraries and that the driver initializes, and reports the actual installed driver and runtime versions, which are compared with the versions advertised by the platform's mechanism to confirm the mechanism reflects the actual state.
 
-The automated tests will default to checking common accelerators (~80% of platforms). If the test encounters an accelerator variant it does not recognize, it will output an "Unknown" status rather than failing, signaling that manual verification is required. We expect the test suite to grow over time to support automated verification for all platforms.
+The automated test defaults to checking common accelerators (~80% of platforms). If it encounters an accelerator variant it does not recognize, it outputs an "Unknown" status and skips rather than failing, signaling that manual verification is required. We expect the test suite to grow over time to support automated verification for all platforms.
 
 ## Implementation History
 
 2025-11-19: KAR created
+
+2026-09-22: `TestAcceleratorDriverRuntimeManagement` added to the AI conformance test suite
 
 ## Related KARs
 
