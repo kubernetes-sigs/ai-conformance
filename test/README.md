@@ -5,6 +5,7 @@ To run these AI Conformance tests, you must have:
 - Kubeconfig: A valid kubeconfig file with cluster-admin permissions for the target cluster.
 - Accelerator Node Pool: The cluster must have nodes with accelerators exposed through the Kubernetes resource management framework — either a DRA driver (ResourceClaims against a DeviceClass such as `gpu.nvidia.com`) or a device plugin (extended resources such as `nvidia.com/gpu`). Make sure your nodes allow testing pods to be scheduled on them (e.g. no taints that prevent scheduling).
 - Cluster Autoscaling Test: `TestAcceleratorClusterAutoscaling` additionally requires a running cluster autoscaler and an isolated accelerator pool with minimum size `N >= 1`, maximum size at least `N+1`, effective capacity for exactly one requested accelerator per baseline node, scale-down enabled, sufficient cloud quota/stock, and one stable node label inherited by new pool nodes. The pool must contain no non-DaemonSet workloads or other Pending Pods explicitly selecting the pool. Device-plugin mode permits unrelated running accelerator workloads outside the pool but rejects other Pending Pods requesting the configured extended resource. DRA mode requires no other active Pods with ResourceClaims or allocated ResourceClaims outside the test namespace while the test runs because DRA devices may use shared topology.
+- AI Service Metrics Test: `TestAIServiceMetrics` needs no accelerator. It requires a monitoring system with a Prometheus-compatible query API, the ability to pull the public `python:3.13-alpine` image, and room to schedule one small Pod (50m CPU, 64Mi memory request).
 - Network Access: The test machine must be able to reach the Kubernetes API server.
 
 ## Running the Tests
@@ -34,6 +35,7 @@ go test -v -short ./test
 | `TestGangScheduling` | Gang Scheduling | MUST |
 | `TestAcceleratorClusterAutoscaling` | Effective Cluster Autoscaling for Accelerators | MUST |
 | `TestRobustCRDControllerOperation` | Robust CRD and Controller Operation | MUST |
+| `TestAIServiceMetrics` | AI Job & Inference Service Metrics | MUST |
 
 ### Accelerator Cluster Autoscaling
 
@@ -44,6 +46,25 @@ If your platform provides cluster autoscaling, you must set this flag and run th
 Scale-up and scale-down can take significantly longer than Go's default test timeout, so it is recommended to use `-timeout 75m` or a larger value. The test also includes configurable observation windows (`-autoscaler-scale-up-timeout`, `-autoscaler-scale-down-timeout`, etc.) since node provisioning times vary heavily by cloud provider. 
 
 Run `go test ./test -args -help` for details on all supported flags.
+
+### AI Job & Inference Service Metrics
+
+The metrics test deploys a small workload that exposes Prometheus metrics, sends it a fixed number of requests, and verifies that the platform's monitoring system collects the matching request count.
+
+The test is **skipped by default**. Point it at the monitoring system's Prometheus-compatible query API with exactly one of:
+
+- `-service-metrics-prometheus-service=<namespace>/<name>:<port>`: an in-cluster Service, reached through the API server service proxy (no port-forward needed).
+- `-service-metrics-query-url=<url>`: any reachable query endpoint, optionally with `-service-metrics-query-bearer-token-file`.
+
+By default the test creates a `monitoring.coreos.com/v1` `ServiceMonitor`. Use `-service-metrics-scrape-labels` if your Prometheus only selects labeled ServiceMonitors (for kube-prometheus-stack: `release=<helm release name>`). If your platform discovers scrape targets another way, pass a templated manifest with `-service-metrics-scrape-manifest`; run `go test ./test -args -help` for the available template fields.
+
+Example with kube-prometheus-stack:
+
+```bash
+go test -v ./test -run TestAIServiceMetrics -args \
+  -service-metrics-prometheus-service=monitoring/prometheus-operated:9090 \
+  -service-metrics-scrape-labels=release=kube-prometheus-stack
+```
 
 ## Vendor Customization & Neutrality
 

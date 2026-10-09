@@ -39,9 +39,12 @@ The test verifies the platform's monitoring system can discover an AI workload e
 
 4. **Cleanup**: Delete the workload and any monitoring configuration created for the test.
 
+This is implemented by `TestAIServiceMetrics` in the AI conformance test suite (see [test/ai_service_metrics_test.go](../../test/ai_service_metrics_test.go)). The test deploys a dependency-free stand-in inference server that exposes request count, latency histogram and queue depth metrics, creates a ServiceMonitor (or a user-supplied scrape manifest), sends a fixed number of requests, and requires the monitoring system to report exactly that request count through a Prometheus-compatible query API.
+
 ## Implementation History
 
 2026-03-12: KAR created
+2026-10-09: Automated conformance test added in test/ai_service_metrics_test.go
 
 ## Related KARs
 
