@@ -621,6 +621,8 @@ func createTestPod(ctx context.Context, t *testing.T, c kubernetes.Interface, po
 
 // waitForPodsRunning waits until every named Pod reaches Running and returns
 // their latest objects. This is shared by tests that coordinate multiple Pods.
+// On timeout the error names the Pod that is not Running yet, its phase, and
+// the scheduler's message if it is unschedulable.
 func waitForPodsRunning(
 	ctx context.Context,
 	c kubernetes.Interface,
@@ -630,11 +632,17 @@ func waitForPodsRunning(
 ) (map[string]*corev1.Pod, error) {
 	running := make(map[string]*corev1.Pod, len(names))
 	var lastAPIError error
+	var notRunning string
 	err := wait.PollUntilContextTimeout(ctx, 3*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
 		clear(running)
 		for _, name := range names {
 			pod, err := c.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
 			if err != nil {
+				if pollDeadlineReached(ctx, err) {
+					// The poll's own deadline, not an API problem; let
+					// the poll report the timeout.
+					return false, nil
+				}
 				lastAPIError = err
 				if isRetryableAPIError(err) {
 					return false, nil
@@ -643,6 +651,12 @@ func waitForPodsRunning(
 			}
 			lastAPIError = nil
 			if pod.Status.Phase != corev1.PodRunning {
+				notRunning = fmt.Sprintf("; pod %s is %s", name, pod.Status.Phase)
+				for _, cond := range pod.Status.Conditions {
+					if cond.Type == corev1.PodScheduled && cond.Status != corev1.ConditionTrue {
+						notRunning += ": " + cond.Message
+					}
+				}
 				return false, nil
 			}
 			running[name] = pod
@@ -650,10 +664,23 @@ func waitForPodsRunning(
 		return true, nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("Pods did not all reach Running within %s%s: %w",
-			timeout, lastAPIErrorSuffix(lastAPIError), err)
+		return nil, fmt.Errorf("Pods did not all reach Running within %s%s%s: %w",
+			timeout, notRunning, lastAPIErrorSuffix(lastAPIError), err)
 	}
 	return running, nil
+}
+
+// pollDeadlineReached reports whether a failed API call was caused by the
+// poll's own deadline rather than the API server: the context expired, or
+// client-go's rate limiter refused to wait past the deadline (it returns
+// "rate: Wait(n=1) would exceed context deadline", which does not wrap
+// context.DeadlineExceeded).
+func pollDeadlineReached(ctx context.Context, err error) bool {
+	if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	deadline, ok := ctx.Deadline()
+	return ok && !time.Now().Before(deadline)
 }
 
 // runTestPod creates the pod described by pc, waits for it to reach Running,

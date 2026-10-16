@@ -58,10 +58,45 @@ func TestWaitForPodsRunning(t *testing.T) {
 		defer cancel()
 		client := fake.NewClientset(
 			&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "a", Namespace: ns}, Status: corev1.PodStatus{Phase: corev1.PodRunning}},
-			&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "b", Namespace: ns}, Status: corev1.PodStatus{Phase: corev1.PodPending}},
+			&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "b", Namespace: ns}, Status: corev1.PodStatus{
+				Phase: corev1.PodPending,
+				Conditions: []corev1.PodCondition{{
+					Type:    corev1.PodScheduled,
+					Status:  corev1.ConditionFalse,
+					Reason:  corev1.PodReasonUnschedulable,
+					Message: "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector.",
+				}},
+			}},
 		)
-		if _, err := waitForPodsRunning(ctx, client, ns, []string{"a", "b"}, time.Second); err == nil {
+		_, err := waitForPodsRunning(ctx, client, ns, []string{"a", "b"}, time.Second)
+		if err == nil {
 			t.Fatal("waitForPodsRunning expected timeout")
+		}
+		want := "pod b is Pending: 0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector."
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err, want)
+		}
+		if strings.Contains(err.Error(), "pod a") {
+			t.Errorf("error %q mentions running pod a", err)
+		}
+	})
+
+	t.Run("a Get failing at the deadline is a timeout, not an API error", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		client := fake.NewClientset()
+		client.PrependReactor("get", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+			// What client-go returns when its rate limiter would have
+			// to wait past the context deadline.
+			<-ctx.Done()
+			return true, nil, errors.New("client rate limiter Wait returned an error: rate: Wait(n=1) would exceed context deadline")
+		})
+		_, err := waitForPodsRunning(ctx, client, ns, []string{"a"}, time.Second)
+		if err == nil {
+			t.Fatal("waitForPodsRunning expected timeout")
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("error %q should wrap context.DeadlineExceeded", err)
 		}
 	})
 
