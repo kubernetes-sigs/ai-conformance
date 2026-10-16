@@ -3,6 +3,8 @@ package conformance
 import (
 	"context"
 	"errors"
+	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -252,6 +254,9 @@ func TestDeleteAndAwaitRelease(t *testing.T) {
 func TestIsRetryableAPIError(t *testing.T) {
 	if !isRetryableAPIError(apierrors.NewTooManyRequests("busy", 0)) {
 		t.Fatal("TooManyRequests should be retryable")
+	}
+	if !isRetryableAPIError(&url.Error{Op: "Get", URL: "https://apiserver", Err: os.ErrDeadlineExceeded}) {
+		t.Fatal("transport timeout should be retryable")
 	}
 	if isRetryableAPIError(apierrors.NewForbidden(schema.GroupResource{Resource: "pods"}, "p", errors.New("denied"))) {
 		t.Fatal("Forbidden should not be retryable")
