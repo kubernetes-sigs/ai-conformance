@@ -31,17 +31,11 @@ import (
 	"k8s.io/component-helpers/scheduling/corev1/nodeaffinity"
 )
 
-// Custom-metrics integration contract for TestHPAAutoscaling (see
-// test/README.md). The platform's monitoring pipeline must scrape Pods
-// carrying hpaMetricSourceLabel on the port named hpaMetricsPortName at
-// hpaMetricsPath, and its custom metrics adapter must serve the
-// hpaMetricSeries gauge as a per-Pod metric (custom.metrics.k8s.io, resource
-// "pods") named -hpa-custom-metric-name.
-//
-// The gauge stands in for an inference server's per-replica request queue
-// depth, a common signal for scaling accelerator-backed inference. The test
-// sets it directly instead of generating load: it checks that the HPA acts
-// on such a signal for accelerator Pods, not inference performance.
+// Integration contract (see test/README.md): the platform scrapes Pods
+// labeled hpaMetricSourceLabel on port hpaMetricsPortName at hpaMetricsPath,
+// and its custom metrics adapter serves the hpaMetricSeries gauge as a
+// per-Pod metric named -hpa-custom-metric-name. The gauge stands in for an
+// inference server's per-replica queue depth; the test sets it directly.
 const (
 	hpaMetricSourceLabel = "ai-conformance.kubernetes.io/hpa-metric-source"
 	hpaAppLabelKey       = "app.kubernetes.io/name"
@@ -54,13 +48,9 @@ const (
 	hpaMetricValueKey    = "value"
 	hpaMinReplicas       = 1
 
-	// Queued requests per replica. Each phase uses a distinct value, and no
-	// Pod can expose a value before the test writes it to the ConfigMap, so a
-	// sample carrying the current phase's value was produced after that
-	// write; samples from an earlier phase are rejected. Adapter timestamps
-	// are not checked: adapters differ in what they report (prometheus-adapter
-	// reports query time) and the test machine's clock is not comparable to
-	// the cluster's.
+	// Each phase uses a distinct value, so a sample with the current phase's
+	// value cannot be stale. Adapter timestamps are not used: adapters differ
+	// in what they report (prometheus-adapter reports the query time).
 	hpaTargetValue    = 10
 	hpaBaselineValue  = 1
 	hpaScaleUpValue   = 100
@@ -68,28 +58,23 @@ const (
 )
 
 // hpaNegativeControlLog starts the log line that opens the negative-control
-// window (the unit-test simulator keys on it).
+// window; the unit-test simulator keys on it.
 const hpaNegativeControlLog = "Negative control"
 
 // Overridden by unit tests.
 var (
 	hpaPollInterval = 5 * time.Second
-	// hpaNegativeControlWindow covers several HPA sync periods (15s by
-	// default) during which the HPA must not scale on a below-target metric.
+	// Several HPA sync periods (15s by default).
 	hpaNegativeControlWindow = time.Minute
 	hpaCleanupTimeout        = 5 * time.Minute
-	// hpaObservationGrace is how long the test may go without a complete
-	// observation of the workload (because API requests fail) before it can
-	// no longer judge the HPA: a wait that ends after such a gap, or a
-	// negative-control window containing one, is an environment error rather
-	// than a conformance failure.
+	// How long the workload may go unobserved (API requests failing) before
+	// the test can no longer attribute an unmet wait to the HPA.
 	hpaObservationGrace = time.Minute
 )
 
 const hpaCustomMetricsGroup = "custom.metrics.k8s.io"
 
-// hpaCustomMetricsVersions are the custom metrics API versions the HPA
-// controller's client supports.
+// Versions supported by the HPA controller's custom metrics client.
 var hpaCustomMetricsVersions = []string{"v1beta2", "v1beta1"}
 
 var (
@@ -184,8 +169,8 @@ func TestHPAAutoscaling(t *testing.T) {
 	}
 }
 
-// hpaRunFailureMessage reports a failed run. When the run context expired,
-// the go test -timeout cut the test short, whatever phase was waiting.
+// hpaRunFailureMessage reports a failed run; an expired run context means the
+// go test -timeout cut it short.
 func hpaRunFailureMessage(runCtx context.Context, err error) string {
 	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 		return hpaFailureMessage(hpaEnvironmentError(fmt.Errorf("the go test -timeout was reached before the test finished (raise it; see test/README.md): %w", err)))
@@ -193,15 +178,14 @@ func hpaRunFailureMessage(runCtx context.Context, err error) string {
 	return hpaFailureMessage(err)
 }
 
-// hpaCleanupReserve is kept free at the end of the go test -timeout for the
-// test's cleanup: s.cleanup (at most hpaCleanupTimeout) and namespace
-// deletion (deleteNamespaceAndWait, at most two one-minute polls). When the timeout itself
-// expires, go test panics without running cleanups, leaving the workload and
-// its accelerators allocated.
+// hpaCleanupReserve is kept free before the go test deadline for s.cleanup
+// (hpaCleanupTimeout) and deleteNamespaceAndWait (two one-minute polls). If
+// the deadline itself is reached, go test exits without running cleanups and
+// leaves the accelerators allocated.
 const hpaCleanupReserve = 10 * time.Minute
 
-// hpaRunContext bounds the scenario so that it stops, and its cleanups run,
-// hpaCleanupReserve before the go test deadline.
+// hpaRunContext stops the scenario hpaCleanupReserve before the go test
+// deadline.
 func hpaRunContext(now, deadline time.Time, hasDeadline bool) (context.Context, context.CancelFunc, error) {
 	if !hasDeadline {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -280,9 +264,8 @@ func parseHPAPodAnnotations(value string) (map[string]string, error) {
 }
 
 // hpaMetricServer serves the mounted ConfigMap value as a Prometheus gauge,
-// re-reading it on every request so ConfigMap updates reach running Pods.
-// /healthz (the readiness probe) succeeds only while the value is a finite
-// number, so a Ready Pod is one that can serve a valid sample.
+// re-reading it on every request. /healthz (the readiness probe) succeeds only
+// while the value is a finite number.
 const hpaMetricServer = `
 import math, os, socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -335,8 +318,7 @@ server.serve_forever()
 `
 
 // hpaWorkloadCommand starts the metric server only if the container sees
-// exactly the requested number of accelerators; otherwise it exits and the
-// Pod never becomes Ready.
+// exactly the requested number of accelerators.
 func hpaWorkloadCommand(cfg AcceleratorConfig) string {
 	return acceleratorProbeCommand(cfg.DevicePattern) + fmt.Sprintf(`
 if [ "$count" -ne %d ]; then
@@ -388,9 +370,7 @@ func buildHPADeployment(namespace, mode string, cfg AcceleratorConfig, image str
 		// Mount the whole ConfigMap directory, never a subPath: subPath
 		// mounts do not receive ConfigMap updates.
 		VolumeMounts: []corev1.VolumeMount{{Name: "metric", MountPath: hpaMetricMountPath, ReadOnly: true}},
-		// Puts the container's last log lines, such as the accelerator check's
-		// "expected 1 accelerator device(s), found 0", into its status when it
-		// exits with an error, so failures can be diagnosed from the Pod alone.
+		// Records the accelerator check's output in the container status.
 		TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
 	}
 
@@ -450,10 +430,8 @@ func buildHPA(namespace string, hc hpaConfig) *autoscalingv2.HorizontalPodAutosc
 	}
 }
 
-// hpaEnvError marks a failure of the test's prerequisites (accelerator
-// capacity, image, metrics pipeline, API access) as opposed to the HPA not
-// scaling correctly once those prerequisites are in place. It survives
-// wrapping, so phases can add context.
+// hpaEnvError marks a failed prerequisite (accelerator capacity, image,
+// metrics pipeline, API access), as opposed to the HPA misbehaving.
 type hpaEnvError struct{ err error }
 
 func (e hpaEnvError) Error() string { return e.err.Error() }
@@ -473,9 +451,8 @@ func hpaFailureMessage(err error) string {
 	return "FAIL: " + err.Error()
 }
 
-// hpaMetricsUnreadable returns the HPA's own report that it could not read
-// its metric (ScalingActive=False, reason FailedGetPodsMetric). That points
-// at the metrics pipeline or the controller's access to it, not at scaling.
+// hpaMetricsUnreadable returns the HPA's own report that it cannot read its
+// metric (ScalingActive=False, FailedGetPodsMetric).
 func hpaMetricsUnreadable(hpa *autoscalingv2.HorizontalPodAutoscaler) (string, bool) {
 	if hpa == nil {
 		return "", false
@@ -488,9 +465,9 @@ func hpaMetricsUnreadable(hpa *autoscalingv2.HorizontalPodAutoscaler) (string, b
 	return "", false
 }
 
-// hpaPhaseFailure classifies a failed HPA phase from its last observation:
-// an environment error if the HPA could not read the metric, otherwise a
-// conformance failure (or the environment error already carried by err).
+// hpaPhaseFailure classifies a failed phase from its last observation: an
+// environment error if the HPA could not read the metric, otherwise a FAIL
+// with the HPA's conditions attached.
 func hpaPhaseFailure(err error, last hpaState) error {
 	switch message, ok := hpaMetricsUnreadable(last.hpa); {
 	case isHPAEnvironmentError(err):
@@ -504,8 +481,6 @@ func hpaPhaseFailure(err error, last hpaState) error {
 	}
 }
 
-// hpaConditionsSummary renders the HPA's conditions (AbleToScale,
-// ScalingActive, ScalingLimited) for a failure message.
 func hpaConditionsSummary(hpa *autoscalingv2.HorizontalPodAutoscaler) string {
 	parts := make([]string, 0, len(hpa.Status.Conditions))
 	for _, c := range hpa.Status.Conditions {
@@ -514,12 +489,10 @@ func hpaConditionsSummary(hpa *autoscalingv2.HorizontalPodAutoscaler) string {
 	return strings.Join(parts, "; ")
 }
 
-// resolveCustomMetricsVersion returns the custom metrics API version the HPA
-// controller reads, chosen the same way as its client: the group's preferred
-// version if the HPA supports it, otherwise the first supported version the
-// group lists. v1beta1 and v1beta2 are separate APIService registrations that
-// may be backed by different adapters, so the test must read the same one.
-// A missing or unavailable adapter is reported here instead of as a timeout.
+// resolveCustomMetricsVersion picks the custom metrics API version the way the
+// HPA controller's client does: the preferred version if supported, else the
+// first supported one listed. v1beta1 and v1beta2 can be served by different
+// adapters, so the test must read the same one as the HPA.
 func resolveCustomMetricsVersion(c kubernetes.Interface) (string, error) {
 	groups, err := c.Discovery().ServerGroups()
 	if err != nil {
@@ -558,8 +531,7 @@ func resolveCustomMetricsVersion(c kubernetes.Interface) (string, error) {
 	return version, nil
 }
 
-// readHPAPodMetrics queries version of the custom metrics API, as the HPA
-// controller does, for the per-Pod metric of the workload Pods in namespace.
+// readHPAPodMetrics reads the workload Pods' metric from the custom metrics API.
 func readHPAPodMetrics(ctx context.Context, c kubernetes.Interface, version, namespace, metricName string) ([]byte, error) {
 	result := c.CoreV1().RESTClient().Get().
 		AbsPath("/apis", hpaCustomMetricsGroup, version).
@@ -590,10 +562,8 @@ type hpaMetricValueList struct {
 	} `json:"items"`
 }
 
-// checkHPAMetricSamples requires every expected Pod to report exactly want
-// for metricName. It rejects missing Pods, stale or wrong values, conflicting
-// duplicates, and samples describing a different object or metric. Samples
-// for other Pods (e.g. ones still terminating) are ignored.
+// checkHPAMetricSamples requires every expected Pod to report exactly want.
+// Samples for other Pods (e.g. ones still terminating) are ignored.
 func checkHPAMetricSamples(body []byte, namespace, metricName string, expectedPods []string, want int) error {
 	var list hpaMetricValueList
 	if err := json.Unmarshal(body, &list); err != nil {
@@ -638,17 +608,12 @@ func checkHPAMetricSamples(body []byte, namespace, metricName string, expectedPo
 	return nil
 }
 
-// hpaState is one observation of everything the scaling assertions use.
+// hpaState is one observation of the HPA, the Deployment and its Pods.
 type hpaState struct {
-	// hpa is nil until the scenario creates it.
-	hpa        *autoscalingv2.HorizontalPodAutoscaler
+	hpa        *autoscalingv2.HorizontalPodAutoscaler // nil until created
 	deployment *appsv1.Deployment
-	// pods are the workload Pods that are neither terminating nor finished,
-	// sorted by name.
-	pods []corev1.Pod
-	// inactive are the remaining workload Pod objects: terminating, Succeeded
-	// or Failed.
-	inactive []corev1.Pod
+	pods       []corev1.Pod // not terminating or finished, sorted by name
+	inactive   []corev1.Pod // terminating, Succeeded or Failed
 }
 
 func getHPAState(ctx context.Context, c kubernetes.Interface, namespace string) (hpaState, error) {
@@ -695,23 +660,17 @@ func (s hpaState) podUIDs() map[types.UID]bool {
 	return uids
 }
 
-// checkHPAStatus requires the HPA to have reconciled its current spec on the
-// custom metric, recorded the phase's metric value, and decided on want
-// replicas.
-//
-// The HPA records as the metric's average the plain mean of the samples of
-// its non-terminating, non-Pending Pods (pkg/controller/podautoscaler), so
-// once every such Pod reports value, the recorded average is exactly value.
-// Requiring that, rather than only the expected side of the target, ties the
-// decision to the current phase. Callers poll, so transient averages while a
-// change propagates are retried rather than failed.
+// checkHPAStatus requires the HPA to be active on the custom metric, to have
+// recorded exactly the phase's value as its average, and to decide on want
+// replicas. The HPA records the plain mean of its Pods' samples, so once every
+// Pod reports value the average is exactly value; matching it, rather than
+// just the side of the target, ties the decision to the current phase.
 func checkHPAStatus(hpa *autoscalingv2.HorizontalPodAutoscaler, metricName string, want int32, value int) error {
 	if hpa == nil {
 		return errors.New("HPA does not exist")
 	}
-	// Released HPA controllers (through v1.36) never set
-	// status.observedGeneration, so it is enforced only when reported. The
-	// test never changes the HPA spec after creating it.
+	// Released HPA controllers (through v1.36) do not set
+	// status.observedGeneration, so it is checked only when reported.
 	if og := hpa.Status.ObservedGeneration; og != nil && *og < hpa.Generation {
 		return fmt.Errorf("HPA status has not observed generation %d", hpa.Generation)
 	}
@@ -746,10 +705,8 @@ func checkHPAStatus(hpa *autoscalingv2.HorizontalPodAutoscaler, metricName strin
 	return nil
 }
 
-// checkHPAWorkload requires the Deployment and its active Pods to
-// agree on want Running and Ready replicas. The test never changes the
-// Deployment's replicas after creating it, so spec.replicas == want can only
-// result from the HPA.
+// checkHPAWorkload requires the Deployment and its active Pods to agree on
+// want Running and Ready replicas. Only the HPA changes spec.replicas.
 func checkHPAWorkload(s hpaState, want int32) error {
 	d := s.deployment
 	if d.Spec.Replicas == nil || *d.Spec.Replicas != want {
@@ -774,7 +731,6 @@ func checkHPAWorkload(s hpaState, want int32) error {
 	return nil
 }
 
-// checkHPAScaledTo combines the HPA and workload checks for a settled state.
 func checkHPAScaledTo(s hpaState, metricName string, want int32, value int) error {
 	if err := checkHPAStatus(s.hpa, metricName, want, value); err != nil {
 		return err
@@ -785,11 +741,10 @@ func checkHPAScaledTo(s hpaState, metricName string, want int32, value int) erro
 	return checkHPAWorkload(s, want)
 }
 
-// checkHPAHeld requires the HPA to keep deciding on want replicas for the
-// phase's metric value and the Deployment to stay at want. It does not
-// re-check the Pods: a Pod evicted or restarted during the window is a
-// lifecycle event, not the HPA scaling.
-func checkHPAHeld(s hpaState, metricName string, want int32, value int) error {
+// checkHPADecided requires the HPA to decide on want replicas for value and
+// the Deployment to be set to want. It does not check the Pods, so an
+// eviction during the negative control does not fail it.
+func checkHPADecided(s hpaState, metricName string, want int32, value int) error {
 	if err := checkHPAStatus(s.hpa, metricName, want, value); err != nil {
 		return err
 	}
@@ -799,44 +754,21 @@ func checkHPAHeld(s hpaState, metricName string, want int32, value int) error {
 	return nil
 }
 
-// checkHPANewPods requires at least minNew of the Pods to be absent from the
-// baseline, so pre-existing Pods cannot satisfy a scale-up.
-func checkHPANewPods(pods []corev1.Pod, baseline map[types.UID]bool, minNew int) error {
-	n := 0
-	for _, pod := range pods {
-		if !baseline[pod.UID] {
-			n++
-		}
-	}
-	if n < minNew {
-		return fmt.Errorf("%d workload Pods were created after the baseline, want at least %d", n, minNew)
-	}
-	return nil
-}
-
 // checkHPARemovedPodsGone requires every Pod the scale-down deleted to be
-// gone, not still terminating. The ReplicaSet removes replicas only by
-// deleting them, so a removed replica is a Pod object with a deletion
-// timestamp until it disappears.
-//
-// Pod lifecycle events that are not part of autoscaling are allowed:
-//   - A Pod the node ended without deleting it (Phase=Failed or Succeeded
-//     with no deletion timestamp, e.g. evicted under node pressure) stays as
-//     an object until something deletes it; it no longer holds an accelerator
-//     (in DRA mode checkHPAClaimsReleased verifies its claim was deallocated).
-//   - A Pod terminating because of a disruption, which Kubernetes marks with
-//     DisruptionTarget=True before deleting it (eviction API, taint-based
-//     eviction, preemption, Pod garbage collection, kubelet). The ReplicaSet
-//     deletes scale-down victims without that condition, so they are never
-//     exempted. A disrupted Pod may terminate slowly or not at all (e.g. on
-//     an unreachable node) for reasons unrelated to the HPA.
-//   - The remaining replica being a replacement for a scaled-up Pod lost in
-//     one of those ways: the HPA's decision is checked through the replica
-//     counts, not through which Pod survived.
+// gone. Pod events outside autoscaling are allowed (and logged by
+// hpaLifecycleNotes):
+//   - a Pod its node ended without deleting it (e.g. evicted under node
+//     pressure) stays until something deletes it, but holds no accelerator;
+//   - a Pod terminating after a disruption carries DisruptionTarget=True
+//     (eviction API, taint eviction, preemption, Pod GC, kubelet), which the
+//     ReplicaSet never sets on the replicas it removes, and may terminate
+//     slowly, e.g. on an unreachable node;
+//   - the remaining replica may replace a Pod lost that way.
 func checkHPARemovedPodsGone(s hpaState) error {
 	var left []string
-	for _, pod := range s.inactive {
-		if _, disrupted := hpaDisruption(&pod); pod.DeletionTimestamp != nil && !disrupted {
+	for i := range s.inactive {
+		pod := &s.inactive[i]
+		if _, disrupted := hpaTerminatingAfterDisruption(pod); pod.DeletionTimestamp != nil && !disrupted {
 			left = append(left, pod.Name+" (Terminating)")
 		}
 	}
@@ -846,10 +778,12 @@ func checkHPARemovedPodsGone(s hpaState) error {
 	return nil
 }
 
-// hpaDisruption returns the reason of a Pod's DisruptionTarget=True
-// condition, which Kubernetes sets on Pods it is about to end for a reason
-// other than their owner deleting them.
-func hpaDisruption(pod *corev1.Pod) (string, bool) {
+// hpaTerminatingAfterDisruption reports whether pod is being deleted with a
+// DisruptionTarget=True condition, and returns the condition's reason.
+func hpaTerminatingAfterDisruption(pod *corev1.Pod) (string, bool) {
+	if pod.DeletionTimestamp == nil {
+		return "", false
+	}
 	for _, c := range pod.Status.Conditions {
 		if c.Type == corev1.DisruptionTarget && c.Status == corev1.ConditionTrue {
 			return c.Reason, true
@@ -858,27 +792,25 @@ func hpaDisruption(pod *corev1.Pod) (string, bool) {
 	return "", false
 }
 
-// hpaClaimHolders returns the UIDs of the Pods whose ResourceClaims may still
-// be allocated after the scale-down: the active Pods and Pods still
-// terminating after a disruption, which keep their claims until they are
-// gone.
+// hpaClaimHolders returns the Pods whose ResourceClaims may still be allocated
+// after the scale-down: the active Pods and Pods terminating after a
+// disruption, which keep their claims until they are gone.
 func hpaClaimHolders(s hpaState) map[types.UID]bool {
 	holders := s.podUIDs()
 	for i := range s.inactive {
-		if _, disrupted := hpaDisruption(&s.inactive[i]); disrupted && s.inactive[i].DeletionTimestamp != nil {
+		if _, disrupted := hpaTerminatingAfterDisruption(&s.inactive[i]); disrupted {
 			holders[s.inactive[i].UID] = true
 		}
 	}
 	return holders
 }
 
-// hpaLifecycleNotes describes, for the log, Pod events outside autoscaling
-// that checkHPARemovedPodsGone allows: Pods the node ended, Pods terminating
-// after a disruption, and replicas that replaced scaled-up Pods.
+// hpaLifecycleNotes describes the Pod events checkHPARemovedPodsGone allows.
 func hpaLifecycleNotes(s hpaState, scaledUp map[types.UID]bool) string {
 	var notes []string
-	for _, pod := range s.inactive {
-		if reason, disrupted := hpaDisruption(&pod); disrupted && pod.DeletionTimestamp != nil {
+	for i := range s.inactive {
+		pod := &s.inactive[i]
+		if reason, disrupted := hpaTerminatingAfterDisruption(pod); disrupted {
 			notes = append(notes, fmt.Sprintf("Pod %s is terminating after a disruption (%s), not removed by the scale-down", pod.Name, reason))
 			continue
 		}
@@ -908,11 +840,9 @@ func hpaReplicaCount(p *int32) int32 {
 	return *p
 }
 
-// verifyHPAPodsOnAccelerators checks that every Pod was granted an
-// accelerator through the resolved allocation mode and runs on a node that
-// can provide it, and that the Pods do not hold more accelerators than
-// exist: in DRA mode no device is allocated to two Pods unless the driver
-// allocated it as separate shares, and in device-plugin mode no node runs
+// verifyHPAPodsOnAccelerators checks that every Pod holds its own accelerator
+// on a node that can provide it: in DRA mode no device is allocated to two
+// Pods (except as separate shares), and in device-plugin mode no node runs
 // more of the Pods than it has allocatable accelerators.
 func verifyHPAPodsOnAccelerators(ctx context.Context, c kubernetes.Interface, pods []corev1.Pod, mode string, cfg AcceleratorConfig) error {
 	nodes := map[string]*corev1.Node{}
@@ -971,12 +901,16 @@ func verifyHPAPodsOnAccelerators(ctx context.Context, c kubernetes.Interface, po
 	return nil
 }
 
-// hpaAPIError marks a definitive API answer, such as Forbidden, as an
-// environment error. NotFound and retryable errors stay plain, so the
-// caller's poll retries them.
-func hpaAPIError(err error) error {
+// isPermanentAPIError reports a definitive API answer, such as Forbidden.
+// NotFound and retryable errors are not permanent, so polls retry them.
+func isPermanentAPIError(err error) bool {
 	var status apierrors.APIStatus
-	if errors.As(err, &status) && !apierrors.IsNotFound(err) && !isRetryableAPIError(err) {
+	return errors.As(err, &status) && !apierrors.IsNotFound(err) && !isRetryableAPIError(err)
+}
+
+// hpaAPIError marks a permanent API error as an environment error.
+func hpaAPIError(err error) error {
+	if isPermanentAPIError(err) {
 		return hpaEnvironmentError(err)
 	}
 	return err
@@ -1005,8 +939,7 @@ func checkHPAPodAccelerator(pod *corev1.Pod, node *corev1.Node, claims []*resour
 }
 
 func checkHPAClaimAllocation(pod *corev1.Pod, node *corev1.Node, claim *resourcev1.ResourceClaim, cfg AcceleratorConfig) error {
-	// Each replica must hold a claim generated for it from the template, not a
-	// claim shared with other Pods, so every replica has its own allocation.
+	// The claim must be generated for this Pod, not shared with other Pods.
 	if owner := metav1.GetControllerOf(claim); owner == nil || owner.Kind != "Pod" || owner.UID != pod.UID {
 		return fmt.Errorf("ResourceClaim %s was not generated for Pod %s (controller owner %v)", claim.Name, pod.Name, owner)
 	}
@@ -1051,10 +984,8 @@ func claimReservedFor(claim *resourcev1.ResourceClaim, pods map[types.UID]bool) 
 	return false
 }
 
-// checkHPAClaimsReleased fails while any ResourceClaim in the list is still
-// allocated without being reserved for one of the live Pods, i.e. while a
-// removed replica's claim still holds its device. Generated claims may
-// outlive their Pod briefly; a deallocated or deleted claim passes.
+// checkHPAClaimsReleased fails while a claim is allocated but not reserved for
+// one of the live Pods.
 func checkHPAClaimsReleased(claims []resourcev1.ResourceClaim, live map[types.UID]bool) error {
 	var held []string
 	for i := range claims {
@@ -1075,16 +1006,11 @@ func checkHPAClaimsReleased(claims []resourcev1.ResourceClaim, live map[types.UI
 	return nil
 }
 
-// hpaPodPrerequisiteProblems lists Pods held back by something other than
-// the HPA: unschedulable (e.g. insufficient accelerator capacity), unable to
-// pull or create the workload container, a workload container that exited
-// with an error, or a Pod the node ended (Phase=Failed, e.g. evicted or
-// rejected at admission because its device could not be allocated). Exited
-// containers cover the container's own startup check failing (it did not see
-// exactly one accelerator device) and a workload image that cannot run the
-// test's script; the recorded output says which. Pods being deleted are
-// skipped: their containers stop as part of a normal removal. None of these
-// says anything about the HPA, so they are never reported as FAIL.
+// hpaPodPrerequisiteProblems lists Pods held back by something other than the
+// HPA: unschedulable, unable to pull or start the container, a container that
+// exited with an error (e.g. the accelerator check), or a Pod its node ended
+// (Phase=Failed, e.g. evicted or rejected at admission). Pods being deleted
+// are skipped, since their containers stop as part of the removal.
 func hpaPodPrerequisiteProblems(pods []corev1.Pod) []string {
 	var out []string
 	for i := range pods {
@@ -1125,9 +1051,7 @@ func (s hpaState) allPods() []corev1.Pod {
 }
 
 // hpaFailedTermination returns the failed exit of a container that is down
-// now: terminated with an error, or waiting to restart after one
-// (CrashLoopBackOff). A container that failed earlier but is running again
-// does not count, so a past restart cannot excuse a later HPA failure.
+// now. A container running again after an earlier failure does not count.
 func hpaFailedTermination(cs corev1.ContainerStatus) *corev1.ContainerStateTerminated {
 	if t := cs.State.Terminated; t != nil {
 		if t.ExitCode != 0 {
@@ -1156,8 +1080,7 @@ func hpaOneLine(message string) string {
 	return message
 }
 
-// hpaScenario drives one baseline, scale-up and scale-down cycle in a
-// test-owned namespace.
+// hpaScenario drives one baseline, scale-up and scale-down cycle.
 type hpaScenario struct {
 	c         kubernetes.Interface
 	namespace string
@@ -1165,8 +1088,7 @@ type hpaScenario struct {
 	cfg       AcceleratorConfig
 	hc        hpaConfig
 	logf      func(format string, args ...any)
-	// readMetrics queries the custom metrics API; unit tests replace it
-	// because the fake clientset does not serve aggregated APIs.
+	// Replaced in unit tests: the fake clientset has no aggregated APIs.
 	readMetrics func(ctx context.Context, namespace, metricName string) ([]byte, error)
 }
 
@@ -1231,9 +1153,7 @@ func (s *hpaScenario) establishBaseline(ctx context.Context) (hpaState, error) {
 		return hpaState{}, hpaEnvironmentError(fmt.Errorf("custom metrics pipeline does not serve the workload metric (see the integration contract in test/README.md): %w", err))
 	}
 
-	// The HPA is created only now, so it cannot act before the workload and
-	// its metric are known to be healthy, and any scaling it does from here
-	// on is attributable to it.
+	// Created only now, so any scaling from here on is the HPA's.
 	if _, err := s.c.AutoscalingV2().HorizontalPodAutoscalers(s.namespace).Create(ctx, buildHPA(s.namespace, s.hc), metav1.CreateOptions{}); err != nil {
 		return hpaState{}, hpaEnvironmentError(fmt.Errorf("create HorizontalPodAutoscaler: %w", err))
 	}
@@ -1245,7 +1165,7 @@ func (s *hpaScenario) establishBaseline(ctx context.Context) (hpaState, error) {
 	}
 	s.logf(hpaNegativeControlLog+": the HPA must stay at %d replica for %s while the metric is below target...", hpaMinReplicas, hpaNegativeControlWindow)
 	held := func(_ context.Context, st hpaState) error {
-		return checkHPAHeld(st, s.hc.metricName, hpaMinReplicas, hpaBaselineValue)
+		return checkHPADecided(st, s.hc.metricName, hpaMinReplicas, hpaBaselineValue)
 	}
 	if last, err := s.holdState(ctx, hpaNegativeControlWindow, held); err != nil {
 		return hpaState{}, hpaPhaseFailure(fmt.Errorf("HPA did not hold %d replica with the metric below target: %w", hpaMinReplicas, err), last)
@@ -1267,42 +1187,23 @@ func (s *hpaScenario) scaleUp(ctx context.Context, baseline hpaState) (hpaState,
 	}
 
 	state, err := s.waitForState(ctx, time.Until(deadline), func(_ context.Context, st hpaState) error {
-		if err := checkHPAStatus(st.hpa, s.hc.metricName, maxReplicas, hpaScaleUpValue); err != nil {
-			return err
-		}
-		if hpaReplicaCount(st.deployment.Spec.Replicas) != maxReplicas {
-			return fmt.Errorf("Deployment spec.replicas=%d, want %d", hpaReplicaCount(st.deployment.Spec.Replicas), maxReplicas)
-		}
-		return nil
+		return checkHPADecided(st, s.hc.metricName, maxReplicas, hpaScaleUpValue)
 	})
 	if err != nil {
 		return hpaState{}, hpaPhaseFailure(fmt.Errorf("HPA did not scale the Deployment to %d replicas on the raised metric: %w", maxReplicas, err), state)
 	}
 	s.logf("HPA set the Deployment to %d replicas; waiting for the new accelerator Pods...", maxReplicas)
 
-	baselineUIDs := baseline.podUIDs()
-	scaledUp := func(ctx context.Context, st hpaState) error {
-		if err := checkHPAScaledTo(st, s.hc.metricName, maxReplicas, hpaScaleUpValue); err != nil {
-			return err
-		}
-		if err := checkHPANewPods(st.pods, baselineUIDs, int(maxReplicas)-len(baselineUIDs)); err != nil {
-			return err
-		}
-		return verifyHPAPodsOnAccelerators(ctx, s.c, st.pods, s.mode, s.cfg)
-	}
-	if state, err = s.waitForState(ctx, time.Until(deadline), scaledUp); err != nil {
-		return hpaState{}, s.scaleUpFailure(fmt.Errorf("the %d scaled-up Pods did not all become Ready on accelerators: %w", maxReplicas, err), state)
-	}
 	// The scaled-up state and the raised metric for exactly its Pods must hold
-	// in a single observation. Polling for that, rather than re-checking once,
-	// tolerates a retryable API error, an HPA sync that briefly fails to read
-	// the metric, and a Pod replaced (e.g. evicted) meanwhile, whose
-	// replacement must then report the metric too; a state that never
-	// converges still fails.
+	// in one observation. The extra -hpa-metric-timeout lets the new Pods'
+	// samples reach the custom metrics API.
 	var metricProblem error
 	state, err = s.waitForState(ctx, time.Until(deadline.Add(s.hc.metricTimeout)), func(ctx context.Context, st hpaState) error {
 		metricProblem = nil
-		if err := scaledUp(ctx, st); err != nil {
+		if err := checkHPAScaledTo(st, s.hc.metricName, maxReplicas, hpaScaleUpValue); err != nil {
+			return err
+		}
+		if err := verifyHPAPodsOnAccelerators(ctx, s.c, st.pods, s.mode, s.cfg); err != nil {
 			return err
 		}
 		body, err := s.readMetrics(ctx, s.namespace, s.hc.metricName)
@@ -1320,17 +1221,15 @@ func (s *hpaScenario) scaleUp(ctx context.Context, baseline hpaState) (hpaState,
 	case metricProblem != nil:
 		return hpaState{}, hpaEnvironmentError(fmt.Errorf("custom metrics pipeline did not report the raised metric for the scaled-up Pods: %w", err))
 	default:
-		return hpaState{}, s.scaleUpFailure(fmt.Errorf("the scaled-up state did not hold while the Pods' metrics were confirmed: %w", err), state)
+		return hpaState{}, s.scaleUpFailure(fmt.Errorf("the %d scaled-up Pods did not all become Ready on accelerators: %w", maxReplicas, err), state)
 	}
 	s.logf("PASS: HPA scaled up to %d replicas; Pods %v are Ready on accelerators", maxReplicas, state.podNames())
 	return state, nil
 }
 
-// scaleUpFailure classifies a failure to get the scaled-up Pods Ready. If the
-// HPA was still deciding on maxReplicas for the raised metric, the HPA did its
-// part, and Pods that cannot start (including Pods the node ended, which
-// getHPAState lists as inactive) are an environment error. Otherwise the HPA's
-// own state decides, as in any other phase.
+// scaleUpFailure classifies a failure to get the scaled-up Pods Ready: if the
+// HPA still decided on maxReplicas for the raised metric, Pods that cannot
+// start are an environment error; otherwise the HPA's state decides.
 func (s *hpaScenario) scaleUpFailure(err error, last hpaState) error {
 	if !isHPAEnvironmentError(err) && checkHPAStatus(last.hpa, s.hc.metricName, s.hc.maxReplicas, hpaScaleUpValue) == nil {
 		if problems := hpaPodPrerequisiteProblems(last.allPods()); len(problems) > 0 {
@@ -1368,26 +1267,20 @@ func (s *hpaScenario) scaleDown(ctx context.Context, scaled hpaState) error {
 				return err
 			}
 		}
-		// The remaining Pod's metric was verified by the waitForMetric above,
-		// which covered every live Pod, or, for a replacement Pod created
-		// since, by the HPA recording exactly the lowered value.
 		return verifyHPAPodsOnAccelerators(ctx, s.c, st.pods, s.mode, s.cfg)
 	})
 	if err != nil {
 		return hpaPhaseFailure(fmt.Errorf("HPA did not scale back down to %d replica with the removed %s: %w", hpaMinReplicas, s.removalDescription(), err), state)
 	}
 	// The stabilization window is reported, not asserted: how soon a correct
-	// HPA may scale down also depends on its controller's sync period, which
-	// the test cannot observe.
+	// HPA scales down also depends on its sync period.
 	s.logf("PASS: HPA scaled down to %d replica (%v) with the removed %s, observed %s after the metric was lowered (scale-down stabilization window %s)%s",
 		hpaMinReplicas, state.podNames(), s.removalDescription(), time.Since(lowered).Round(time.Second), s.hc.stabilization, hpaLifecycleNotes(state, scaledUIDs))
 	return nil
 }
 
-// removalDescription states what the test verifies about removed replicas.
-// With DRA, deallocated ResourceClaims show the devices were given back.
-// With a device plugin, the test sees only that the Pod objects are gone; it
-// does not observe the plugin returning the device to its pool.
+// removalDescription states what the test verifies about removed replicas;
+// with a device plugin it cannot see the device being returned.
 func (s *hpaScenario) removalDescription() string {
 	if s.mode == allocationModeDRA {
 		return "Pods deleted and their ResourceClaims no longer allocated"
@@ -1395,23 +1288,20 @@ func (s *hpaScenario) removalDescription() string {
 	return "Pods deleted"
 }
 
-// fixedPods expects samples from exactly the named Pods.
 func fixedPods(names []string) func(context.Context) ([]string, error) {
 	return func(context.Context) ([]string, error) { return names, nil }
 }
 
-// livePods expects samples from whichever workload Pods are currently not
-// terminating, for phases in which the HPA may remove Pods while it waits.
+// livePods returns the current active Pods, for phases in which the HPA may
+// remove Pods while the test waits for their metric.
 func (s *hpaScenario) livePods(ctx context.Context) ([]string, error) {
 	st, err := getHPAState(ctx, s.c, s.namespace)
 	return st.podNames(), err
 }
 
-// waitForMetric waits until the custom metrics API reports want for every
-// Pod returned by expected, which is re-evaluated on each poll. NotFound is
-// retried because adapters return it until the first scrape of a new series
-// is ingested; only definitive API answers such as Forbidden end the wait
-// early.
+// waitForMetric waits until the custom metrics API reports want for every Pod
+// returned by expected. Adapters answer NotFound until a new series is
+// scraped, so only permanent errors end the wait early.
 func (s *hpaScenario) waitForMetric(ctx context.Context, want int, expected func(context.Context) ([]string, error)) error {
 	var pods []string
 	var lastSamples, lastAPIError error
@@ -1428,8 +1318,7 @@ func (s *hpaScenario) waitForMetric(ctx context.Context, want int, expected func
 		body, err := s.readMetrics(ctx, s.namespace, s.hc.metricName)
 		if err != nil {
 			lastAPIError = err
-			var status apierrors.APIStatus
-			if errors.As(err, &status) && !apierrors.IsNotFound(err) && !isRetryableAPIError(err) {
+			if isPermanentAPIError(err) {
 				return false, err
 			}
 			return false, nil
@@ -1449,16 +1338,12 @@ func (s *hpaScenario) waitForMetric(ctx context.Context, want int, expected func
 	return nil
 }
 
-// waitForState polls until check accepts a single observation of the HPA,
-// Deployment and Pods, and returns that observation (or the last one seen).
-//
-// A wait ends in a conformance failure only if the workload was completely
-// observed, and still not in the wanted state, within hpaObservationGrace of
-// its end. A complete observation is one in which getHPAState and every API
-// read made by check succeeded; a retryable error in either leaves the
-// observation incomplete. If the API server stopped answering for longer
-// than that, the HPA may have reached the state unseen, so the result is an
-// environment error.
+// waitForState polls until check accepts an observation, and returns it (or
+// the last one seen). A timeout is a FAIL only if the workload was fully
+// observed, still not in the wanted state, within hpaObservationGrace of the
+// end; a retryable API error in getHPAState or in check leaves an observation
+// incomplete. Otherwise the HPA may have reached the state unseen, and the
+// result is an environment error.
 func (s *hpaScenario) waitForState(ctx context.Context, timeout time.Duration, check func(context.Context, hpaState) error) (hpaState, error) {
 	var last hpaState
 	var lastProblem, lastAPIError error
@@ -1467,24 +1352,18 @@ func (s *hpaScenario) waitForState(ctx context.Context, timeout time.Duration, c
 		st, err := getHPAState(ctx, s.c, s.namespace)
 		if err != nil {
 			if ctx.Err() != nil {
-				// The wait's own deadline cut the request short: a timeout,
-				// not an access problem.
-				return false, nil
+				return false, nil // the wait's own deadline cut the request short
 			}
 			lastAPIError = err
 			if isRetryableAPIError(err) {
 				return false, nil
 			}
-			// A permanent error reading the test's own objects (e.g.
-			// Forbidden) is an access problem even after earlier observations
-			// succeeded.
 			return false, hpaEnvironmentError(fmt.Errorf("observe the test workload: %w", err))
 		}
 		last = st
 		problem := check(ctx, st)
 		switch {
 		case ctx.Err() != nil:
-			// Keep the last complete observation for the error message.
 			return false, nil
 		case isHPAEnvironmentError(problem):
 			return false, problem
@@ -1503,8 +1382,6 @@ func (s *hpaScenario) waitForState(ctx context.Context, timeout time.Duration, c
 	case isHPAEnvironmentError(err):
 		return last, err
 	case lastObserved.IsZero():
-		// Never observed (e.g. the API server unreachable): the test's
-		// access, not the workload, is the problem.
 		return last, hpaEnvironmentError(fmt.Errorf("could not observe the test workload within %s%s: %w", timeout, lastAPIErrorSuffix(lastAPIError), err))
 	case time.Since(lastObserved) > hpaObservationGrace:
 		return last, hpaEnvironmentError(fmt.Errorf("the test workload was not observed for the last %s of the %s wait, so the HPA may have reached the wanted state unseen; last observation: %v%s: %w",
@@ -1514,11 +1391,10 @@ func (s *hpaScenario) waitForState(ctx context.Context, timeout time.Duration, c
 	}
 }
 
-// holdState requires check to accept every observation for window, ending
-// with a successful observation at or after the end of the window, and
-// returns the last observation. Retryable API errors skip an observation
-// rather than failing it, but the window must not go unobserved for longer
-// than hpaObservationGrace, or the HPA could have scaled and returned unseen.
+// holdState requires check to accept every observation for window, including
+// one at or after its end. Retryable API errors skip an observation, but a
+// gap longer than hpaObservationGrace is an environment error, since the HPA
+// could have scaled and returned unseen.
 func (s *hpaScenario) holdState(ctx context.Context, window time.Duration, check func(context.Context, hpaState) error) (hpaState, error) {
 	start := time.Now()
 	end := start.Add(window)
@@ -1553,13 +1429,10 @@ func (s *hpaScenario) holdState(ctx context.Context, window time.Duration, check
 	}
 }
 
-// cleanup deletes the HPA first, so it cannot react to the Deployment's
-// deletion, then the Deployment, and waits until no workload Pod object
-// remains and, in DRA mode, no ResourceClaim in the namespace is still
-// allocated, so a later accelerator test does not race the release. Every
-// step is attempted even if an earlier one fails, all of them share one
-// hpaCleanupTimeout deadline, so a request the API server never answers
-// cannot block the test, and every failure is returned.
+// cleanup deletes the HPA, then the Deployment, and waits until no workload
+// Pod remains and, in DRA mode, no claim is allocated, so later accelerator
+// tests do not race the release. Every step is attempted, all share one
+// hpaCleanupTimeout deadline, and all failures are returned.
 func (s *hpaScenario) cleanup(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, hpaCleanupTimeout)
 	defer cancel()
@@ -1617,10 +1490,9 @@ func (s *hpaScenario) cleanup(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// hpaRetry is retry.OnError, except that it returns fn's last error. OnError
-// returns nil when fn fails with an error wrapping a context deadline that is
-// not retriable (it treats it as its own interruption), so a request cut off
-// by the deadline would otherwise look successful.
+// hpaRetry is retry.OnError, but returns fn's last error: OnError returns nil
+// when fn fails with a non-retriable error wrapping a context deadline, so a
+// request cut off by the deadline would look successful.
 func hpaRetry(backoff wait.Backoff, retriable func(error) bool, fn func() error) error {
 	var last error
 	err := retry.OnError(backoff, retriable, func() error {

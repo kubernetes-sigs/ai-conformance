@@ -39,10 +39,8 @@ import (
 
 func hpaPtr[T any](v T) *T { return &v }
 
-// fastHPATiming shortens the scenario's polling so unit tests run in
-// milliseconds. The observation grace stays well above a poll's duration
-// under -race with the parallel scenarios, which can reach tens of
-// milliseconds.
+// fastHPATiming shortens the scenario's timing for unit tests. The grace stays
+// well above one poll, which can take tens of milliseconds under -race.
 func fastHPATiming(t *testing.T) {
 	t.Helper()
 	poll, window, cleanup, grace := hpaPollInterval, hpaNegativeControlWindow, hpaCleanupTimeout, hpaObservationGrace
@@ -55,6 +53,24 @@ func fastHPATiming(t *testing.T) {
 func testHPAConfig(t *testing.T, timeout time.Duration) hpaConfig {
 	t.Helper()
 	return testHPAConfigN(t, timeout, 2)
+}
+
+// testHPAScenario returns a device-plugin scenario with one-second timeouts.
+func testHPAScenario(t *testing.T, c kubernetes.Interface) *hpaScenario {
+	t.Helper()
+	return newHPAScenario(c, "ns", allocationModeDevicePlugin, "v1beta2", nvidiaConfig(t), testHPAConfig(t, time.Second), t.Logf)
+}
+
+// wantHPAError requires err to be nil if want is empty, and otherwise to
+// contain want.
+func wantHPAError(t *testing.T, err error, want string) {
+	t.Helper()
+	switch {
+	case want == "" && err != nil:
+		t.Fatalf("unexpected error: %v", err)
+	case want != "" && (err == nil || !strings.Contains(err.Error(), want)):
+		t.Fatalf("error = %v, want it to contain %q", err, want)
+	}
 }
 
 func testHPAConfigN(t *testing.T, timeout time.Duration, maxReplicas int) hpaConfig {
@@ -105,15 +121,7 @@ func TestNewHPAConfig(t *testing.T) {
 			a := valid
 			tt.mutate(&a)
 			_, err := newHPAConfig(a.metric, a.maxReplicas, a.annotations, a.image, a.metricTimeout, a.scaleUp, a.scaleDown, a.stabilization)
-			if tt.wantErr == "" {
-				if err != nil {
-					t.Fatalf("unexpected error: %v", err)
-				}
-				return
-			}
-			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
-				t.Fatalf("error = %v, want it to contain %q", err, tt.wantErr)
-			}
+			wantHPAError(t, err, tt.wantErr)
 		})
 	}
 }
@@ -409,9 +417,7 @@ func TestSetHPAMetricValue(t *testing.T) {
 		}
 	})
 
-	// Regression: retry.RetryOnConflict returns nil when the request fails
-	// with an error wrapping a context deadline, so an update cut off by the
-	// deadline looked successful.
+	// retry.RetryOnConflict alone would return nil here (see hpaRetry).
 	t.Run("update cut off by the deadline fails", func(t *testing.T) {
 		c := hpaUnresponsiveServer(t)
 		deadline, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
@@ -460,15 +466,7 @@ func TestCheckHPAMetricSamples(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := checkHPAMetricSamples(tt.body, ns, metric, []string{"a", "b"}, hpaScaleUpValue)
-			if tt.wantErr == "" {
-				if err != nil {
-					t.Fatalf("unexpected error: %v", err)
-				}
-				return
-			}
-			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
-				t.Fatalf("error = %v, want it to contain %q", err, tt.wantErr)
-			}
+			wantHPAError(t, err, tt.wantErr)
 		})
 	}
 }
@@ -539,9 +537,7 @@ func TestReadHPAPodMetrics(t *testing.T) {
 		}
 	})
 
-	// Regression: a NotFound from the adapter (metric not yet ingested) used to
-	// trigger a fallback request whose generic 404 replaced the adapter's
-	// message.
+	// The adapter's own message (e.g. why a metric is not found) is kept.
 	t.Run("keeps the adapter's error", func(t *testing.T) {
 		var calls int32
 		c := hpaCustomMetricsServer(t, func(string, *http.Request) (int, []byte) {
@@ -643,8 +639,7 @@ func TestResolveCustomMetricsVersion(t *testing.T) {
 		{name: "only v1beta2", versions: []string{g + "v1beta2"}, want: "v1beta2"},
 		{name: "only v1beta1", versions: []string{g + "v1beta1"}, want: "v1beta1"},
 		{name: "preferred v1beta2", versions: []string{g + "v1beta2", g + "v1beta1"}, want: "v1beta2"},
-		// Regression: the test used to read v1beta2 whenever it was served,
-		// while the HPA controller reads the preferred version.
+		// The test must read the version the HPA controller reads.
 		{name: "preferred v1beta1 is what the HPA reads", versions: []string{g + "v1beta1", g + "v1beta2"}, want: "v1beta1"},
 		{name: "unsupported preferred version falls back to a listed supported one", versions: []string{g + "v1alpha1", g + "v1beta1"}, want: "v1beta1"},
 		{name: "only unsupported versions", versions: []string{g + "v1alpha1"}, wantErr: "none of which the HPA supports"},
@@ -834,8 +829,7 @@ func TestHPAPodPrerequisiteProblems(t *testing.T) {
 			State: running, RestartCount: 1, LastTerminationState: exited(1, "transient"),
 		}}})},
 		{name: "healthy", pod: hpaReadyPod("h", "n", "uid-h")},
-		// Regression: Pods the node ended are terminal (Phase=Failed) and
-		// were only ever looked for among active Pods.
+		// Pods the node ended are terminal (Phase=Failed).
 		{name: "rejected at admission", pod: pod("i", corev1.PodStatus{Phase: corev1.PodFailed, Reason: "UnexpectedAdmissionError",
 			Message: "Allocate failed due to requested number of devices unavailable for nvidia.com/gpu. Requested: 1, Available: 0"}),
 			want: "i failed (UnexpectedAdmissionError: Allocate failed due to requested number of devices unavailable"},
@@ -869,9 +863,6 @@ func TestHPAPodPrerequisiteProblems(t *testing.T) {
 func TestWaitForStateClassification(t *testing.T) {
 	fastHPATiming(t)
 	ctx := context.Background()
-	scenario := func(c kubernetes.Interface) *hpaScenario {
-		return newHPAScenario(c, "ns", allocationModeDevicePlugin, "v1beta2", nvidiaConfig(t), testHPAConfig(t, time.Second), t.Logf)
-	}
 	accept := func(context.Context, hpaState) error { return nil }
 
 	t.Run("permanent API error", func(t *testing.T) {
@@ -880,7 +871,7 @@ func TestWaitForStateClassification(t *testing.T) {
 			return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "horizontalpodautoscalers"}, "x", errors.New("denied"))
 		})
 		start := time.Now()
-		_, err := scenario(c).waitForState(ctx, time.Second, accept)
+		_, err := testHPAScenario(t, c).waitForState(ctx, time.Second, accept)
 		if !isHPAEnvironmentError(err) || !apierrors.IsForbidden(err) || !strings.Contains(err.Error(), "observe the test workload") {
 			t.Fatalf("error = %q, want an environment error wrapping Forbidden", hpaFailureMessage(err))
 		}
@@ -894,7 +885,7 @@ func TestWaitForStateClassification(t *testing.T) {
 		c.PrependReactor("get", "horizontalpodautoscalers", func(k8stesting.Action) (bool, runtime.Object, error) {
 			return true, nil, apierrors.NewServiceUnavailable("overloaded")
 		})
-		_, err := scenario(c).waitForState(ctx, 50*time.Millisecond, accept)
+		_, err := testHPAScenario(t, c).waitForState(ctx, 50*time.Millisecond, accept)
 		if !isHPAEnvironmentError(err) || !strings.Contains(err.Error(), "could not observe") {
 			t.Fatalf("error = %q, want an environment error", hpaFailureMessage(err))
 		}
@@ -915,22 +906,18 @@ func TestWaitForStateClassification(t *testing.T) {
 	}
 	notScaled := func(context.Context, hpaState) error { return errors.New("not scaled yet") }
 
-	// Regression: a permanent error after a successful observation used to
-	// be reported as a conformance failure of the last observation.
 	t.Run("permanent API error after an observation", func(t *testing.T) {
 		forbidden := apierrors.NewForbidden(schema.GroupResource{Group: "apps", Resource: "deployments"}, hpaWorkloadName, errors.New("RBAC changed"))
 		start := time.Now()
-		_, err := scenario(failingAfter(1, forbidden)).waitForState(ctx, time.Second, notScaled)
+		_, err := testHPAScenario(t, failingAfter(1, forbidden)).waitForState(ctx, time.Second, notScaled)
 		if !isHPAEnvironmentError(err) || !apierrors.IsForbidden(err) || time.Since(start) > 500*time.Millisecond {
 			t.Fatalf("error = %q after %s, want a prompt environment error wrapping Forbidden", hpaFailureMessage(err), time.Since(start))
 		}
 	})
 
-	// Regression: after one observation, an API outage lasting until the
-	// deadline was reported as a conformance failure of that observation,
-	// although the HPA may have reached the state unseen.
+	// The HPA may have reached the state while the API was unreachable.
 	t.Run("prolonged API outage after an observation", func(t *testing.T) {
-		_, err := scenario(failingAfter(1, apierrors.NewServiceUnavailable("overloaded"))).waitForState(ctx, time.Second, notScaled)
+		_, err := testHPAScenario(t, failingAfter(1, apierrors.NewServiceUnavailable("overloaded"))).waitForState(ctx, time.Second, notScaled)
 		if !isHPAEnvironmentError(err) || !strings.Contains(err.Error(), "was not observed for the last") || !strings.Contains(err.Error(), "overloaded") {
 			t.Fatalf("error = %q, want an environment error for the unobserved end of the wait", hpaFailureMessage(err))
 		}
@@ -945,18 +932,18 @@ func TestWaitForStateClassification(t *testing.T) {
 			}
 			return false, nil, nil
 		})
-		_, err := scenario(c).waitForState(ctx, 100*time.Millisecond, notScaled)
+		_, err := testHPAScenario(t, c).waitForState(ctx, 100*time.Millisecond, notScaled)
 		if err == nil || isHPAEnvironmentError(err) || !strings.Contains(err.Error(), "last observation: not scaled yet") {
 			t.Fatalf("error = %q, want the conformance failure of the last observation", hpaFailureMessage(err))
 		}
 	})
 
-	// Regression: a retryable error from an API read inside the check (a
-	// Node or ResourceClaim) was recorded as the workload's problem.
+	// A failed Node or ResourceClaim read inside the check is not the
+	// workload's problem.
 	t.Run("retryable API errors inside the check are not observations", func(t *testing.T) {
 		c := fake.NewClientset(&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: hpaWorkloadName, Namespace: "ns"}})
 		var calls atomic.Int32
-		_, err := scenario(c).waitForState(ctx, time.Second, func(context.Context, hpaState) error {
+		_, err := testHPAScenario(t, c).waitForState(ctx, time.Second, func(context.Context, hpaState) error {
 			if calls.Add(1) == 1 {
 				return errors.New("not scaled yet")
 			}
@@ -967,9 +954,8 @@ func TestWaitForStateClassification(t *testing.T) {
 		}
 	})
 
-	// Regression: when the wait's own deadline expired during a request, the
-	// resulting context error was reported as an access problem instead of
-	// the wanted state not being reached.
+	// The wait's own deadline cutting a request short is a timeout, not an
+	// access problem.
 	t.Run("deadline expiring during a request", func(t *testing.T) {
 		// A grace longer than the stalled request isolates the deadline
 		// handling from the observation-gap rule.
@@ -985,7 +971,7 @@ func TestWaitForStateClassification(t *testing.T) {
 			time.Sleep(100 * time.Millisecond) // past the wait's deadline
 			return true, nil, fmt.Errorf("client rate limiter Wait returned an error: %w", context.DeadlineExceeded)
 		})
-		_, err := scenario(c).waitForState(ctx, 30*time.Millisecond, notScaled)
+		_, err := testHPAScenario(t, c).waitForState(ctx, 30*time.Millisecond, notScaled)
 		if err == nil || isHPAEnvironmentError(err) || !strings.Contains(err.Error(), "last observation: not scaled yet") {
 			t.Fatalf("error = %q, want the conformance failure of the last observation", hpaFailureMessage(err))
 		}
@@ -1000,14 +986,14 @@ func TestWaitForStateClassification(t *testing.T) {
 			}
 			return false, nil, nil
 		})
-		if _, err := scenario(c).waitForState(ctx, time.Second, func(context.Context, hpaState) error { return nil }); err != nil {
+		if _, err := testHPAScenario(t, c).waitForState(ctx, time.Second, func(context.Context, hpaState) error { return nil }); err != nil {
 			t.Fatalf("waitForState = %v, want success after the retryable error", err)
 		}
 	})
 
 	t.Run("observed but never in the wanted state", func(t *testing.T) {
 		c := fake.NewClientset(&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: hpaWorkloadName, Namespace: "ns"}})
-		_, err := scenario(c).waitForState(ctx, 50*time.Millisecond, func(context.Context, hpaState) error {
+		_, err := testHPAScenario(t, c).waitForState(ctx, 50*time.Millisecond, func(context.Context, hpaState) error {
 			return errors.New("not scaled")
 		})
 		if err == nil || isHPAEnvironmentError(err) || !strings.Contains(err.Error(), "not scaled") {
@@ -1077,8 +1063,6 @@ func TestCheckHPAScaledTo(t *testing.T) {
 		{name: "scaled down", want: 1, average: "2", value: 2},
 		{name: "HPA missing", want: 2, average: "100", value: 100,
 			mutate: func(s *hpaState) { s.hpa = nil }, wantErr: "HPA does not exist"},
-		// Regression: released HPA controllers (through v1.36) never set
-		// status.observedGeneration; requiring it failed every real cluster.
 		{name: "observedGeneration unset, as released HPA controllers leave it", want: 2, average: "100", value: 100,
 			mutate: func(s *hpaState) { s.hpa.Status.ObservedGeneration = nil }},
 		{name: "HPA status reports an older generation", want: 2, average: "100", value: 100,
@@ -1124,31 +1108,18 @@ func TestCheckHPAScaledTo(t *testing.T) {
 				tt.mutate(&s)
 			}
 			err := checkHPAScaledTo(s, "m", tt.want, tt.value)
-			if tt.wantErr == "" {
-				if err != nil {
-					t.Fatalf("unexpected error: %v", err)
-				}
-				return
-			}
-			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
-				t.Fatalf("error = %v, want it to contain %q", err, tt.wantErr)
-			}
+			wantHPAError(t, err, tt.wantErr)
 		})
 	}
 }
 
-// TestCheckHPAHeld covers the negative control's check: the HPA's decision
-// and the Deployment's replicas, not the Pods.
-func TestCheckHPAHeld(t *testing.T) {
+func TestCheckHPADecided(t *testing.T) {
 	tests := []struct {
 		name    string
 		mutate  func(*hpaState)
 		wantErr string
 	}{
 		{name: "held"},
-		// Regression: the negative control also required the Pods to be
-		// Ready, so an eviction during the window was reported as the HPA
-		// failing to hold.
 		{name: "Pod evicted during the window", mutate: func(s *hpaState) {
 			s.inactive, s.pods = s.pods, nil
 			s.inactive[0].Status.Phase = corev1.PodFailed
@@ -1166,21 +1137,11 @@ func TestCheckHPAHeld(t *testing.T) {
 			if tt.mutate != nil {
 				tt.mutate(&s)
 			}
-			err := checkHPAHeld(s, "m", 1, 1)
+			err := checkHPADecided(s, "m", 1, 1)
 			if (tt.wantErr == "") != (err == nil) || (err != nil && !strings.Contains(err.Error(), tt.wantErr)) {
 				t.Fatalf("error = %v, want %q", err, tt.wantErr)
 			}
 		})
-	}
-}
-
-func TestCheckHPANewPods(t *testing.T) {
-	pods := []corev1.Pod{hpaReadyPod("old", "n", "u1"), hpaReadyPod("new", "n", "u2")}
-	if err := checkHPANewPods(pods, map[types.UID]bool{"u1": true}, 1); err != nil {
-		t.Fatalf("one new Pod rejected: %v", err)
-	}
-	if err := checkHPANewPods(pods, map[types.UID]bool{"u1": true, "u2": true}, 1); err == nil {
-		t.Fatal("pre-existing Pods were counted as new")
 	}
 }
 
@@ -1208,16 +1169,11 @@ func TestCheckHPARemovedPodsGone(t *testing.T) {
 		{name: "survivor from the scaled-up set", state: hpaState{pods: []corev1.Pod{hpaReadyPod("p1", "n", "u1")}}},
 		{name: "removed Pod terminating", state: hpaState{pods: []corev1.Pod{hpaReadyPod("p1", "n", "u1")}, inactive: []corev1.Pod{terminating}}, wantErr: "p2 (Terminating)"},
 		{name: "removed Pod terminating in a terminal phase", state: hpaState{pods: []corev1.Pod{hpaReadyPod("p1", "n", "u1")}, inactive: []corev1.Pod{terminatingFailed}}, wantErr: "p2 (Terminating)"},
-		// Regression: Pod lifecycle events outside autoscaling failed the
-		// scale-down. A Pod the node ended stays as an object until something
-		// deletes it, and its replacement is not one of the scaled-up Pods.
+		// Pod events outside autoscaling are allowed and noted.
 		{name: "Pod evicted by its node", state: hpaState{pods: []corev1.Pod{hpaReadyPod("p1", "n", "u1")}, inactive: []corev1.Pod{evicted}},
 			wantNotes: "Pod p2 was ended by its node (Failed: Evicted), not removed by the scale-down"},
 		{name: "replacement for an evicted Pod", state: hpaState{pods: []corev1.Pod{hpaReadyPod("p3", "n", "u3")}, inactive: []corev1.Pod{evicted}},
 			wantNotes: "Pod p3 replaced a scaled-up Pod"},
-		// Regression: a Pod terminating because of a disruption (eviction
-		// API, taint manager, preemption, ...) was not deleted by the
-		// scale-down, so it must not count as a replica it failed to remove.
 		{name: "Pod terminating after an eviction", state: hpaState{pods: []corev1.Pod{hpaReadyPod("p3", "n", "u3")}, inactive: []corev1.Pod{disrupted}},
 			wantNotes: "Pod p2 is terminating after a disruption (EvictionByEvictionAPI), not removed by the scale-down"},
 		// Only a DisruptionTarget=True condition exempts a terminating Pod.
@@ -1232,15 +1188,7 @@ func TestCheckHPARemovedPodsGone(t *testing.T) {
 				t.Errorf("notes = %q, want %q", notes, tt.wantNotes)
 			}
 			err := checkHPARemovedPodsGone(tt.state)
-			if tt.wantErr == "" {
-				if err != nil {
-					t.Fatalf("unexpected error: %v", err)
-				}
-				return
-			}
-			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
-				t.Fatalf("error = %v, want it to contain %q", err, tt.wantErr)
-			}
+			wantHPAError(t, err, tt.wantErr)
 		})
 	}
 }
@@ -1367,9 +1315,7 @@ func TestCheckHPAPodAccelerator(t *testing.T) {
 		{name: "DRA claim missing from status", pod: dra, node: gpuNode, mode: allocationModeDRA, wantErr: "0 generated ResourceClaims"},
 		{name: "DRA claim not allocated", pod: dra, node: gpuNode, mode: allocationModeDRA,
 			claims: unallocated, wantErr: "not allocated"},
-		// Regression: a claim allocated and reserved for the Pod was accepted
-		// even when it was not generated for it, so replicas sharing one
-		// claim (one device) all passed.
+		// Replicas must not share one claim (one device).
 		{name: "DRA claim generated for another Pod", pod: dra, node: gpuNode, mode: allocationModeDRA,
 			claims: []*resourcev1.ResourceClaim{ownedBy(claim("pod-uid", cfg.DRADriver, 1, "")[0], "other-uid")}, wantErr: "was not generated for Pod"},
 		{name: "DRA claim without a controller owner", pod: dra, node: gpuNode, mode: allocationModeDRA,
@@ -1391,15 +1337,7 @@ func TestCheckHPAPodAccelerator(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			pod := tt.pod
 			err := checkHPAPodAccelerator(&pod, tt.node, tt.claims, tt.mode, cfg)
-			if tt.wantErr == "" {
-				if err != nil {
-					t.Fatalf("unexpected error: %v", err)
-				}
-				return
-			}
-			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
-				t.Fatalf("error = %v, want it to contain %q", err, tt.wantErr)
-			}
+			wantHPAError(t, err, tt.wantErr)
 		})
 	}
 }
@@ -1541,16 +1479,15 @@ type simCluster struct {
 	replaceOnShrink   bool // scaling down replaces every Pod instead of removing the extras
 	admissionFailure  bool // Pods after the first one are rejected at admission (Phase=Failed), as when a device cannot be allocated
 	evictOnScaleDown  bool // the node evicts one Pod (Phase=Failed, not deleted) once the metric is lowered
+	shareFirstClaim   bool // DRA: Pods after the first one use the first Pod's ResourceClaim (one device)
 	// disruptOnScaleDown evicts one Pod through the eviction API once the
 	// metric is lowered, and the Pod then stays Terminating (e.g. its node
 	// stopped responding) with its DRA claim still allocated.
 	disruptOnScaleDown bool
 	removal            simRemoval
-	// The settle* knobs act when the raised metric is served for all
-	// maxReplicas Pods, i.e. while the test confirms the scaled-up state.
-	// settleAPIError makes the next Node read fail with a retryable error,
-	// each time; settleReplacePod deletes one scaled-up Pod once (as an
-	// eviction would), so the ReplicaSet replaces it.
+	// The settle* knobs act while the test confirms the scaled-up state:
+	// settleAPIError fails the next Node read with a retryable error, and
+	// settleReplacePod deletes one scaled-up Pod once.
 	settleAPIError   bool
 	settleReplacePod bool
 	maxReplicas      int
@@ -1559,10 +1496,8 @@ type simCluster struct {
 	// recordedLag makes the HPA record the previous phase's average for this
 	// long after each metric change, as a real HPA does until its next sync.
 	recordedLag time.Duration
-	// recordedStaleBelow makes the HPA keep recording the first below-target
-	// average it saw (the baseline's) whenever the value is below target,
-	// while still scaling on the current value: the recorded value is on the
-	// right side of the target but belongs to another phase.
+	// recordedStaleBelow makes the HPA keep recording the baseline's average
+	// whenever the value is below target, while scaling on the current value.
 	recordedStaleBelow bool
 
 	mu          sync.Mutex
@@ -1809,6 +1744,10 @@ func (k *simCluster) createPod(ctx context.Context, d *appsv1.Deployment, index 
 		pod.Spec.NodeName = "gpu-node"
 		pod.Status = corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}
 		if k.mode == allocationModeDRA {
+			if k.shareFirstClaim && index >= 1 {
+				pod.Status.ResourceClaimStatuses = []corev1.PodResourceClaimStatus{{Name: "claim", ResourceClaimName: hpaPtr(hpaWorkloadName + "-1-claim")}}
+				break
+			}
 			claim := hpaAllocatedClaim(pod.Name+"-claim", pod.UID, k.cfg.DRADriver, 1, "gpu-node")
 			claim.Namespace = k.ns
 			claim.Status.Allocation.Devices.Results[0].Device = fmt.Sprintf("gpu-%d", k.seq) // one device per Pod
@@ -1858,11 +1797,8 @@ func (k *simCluster) removePod(ctx context.Context, pod *corev1.Pod, gc bool) {
 	}
 }
 
-// checkCompletedCycle independently confirms, from what the simulated
-// cluster saw, that a passing run went through a full cycle: maxReplicas
-// distinct Pods running at once, the raised metric served for each of them,
-// and a single Pod left afterwards with no other Pod object or allocated
-// claim remaining.
+// checkCompletedCycle confirms, from what the simulated cluster saw, that a
+// passing run really scaled up and back down.
 func (k *simCluster) checkCompletedCycle(t *testing.T, maxReplicas int) {
 	t.Helper()
 	ctx := context.Background()
@@ -1900,8 +1836,7 @@ func (k *simCluster) checkCompletedCycle(t *testing.T, maxReplicas int) {
 }
 
 // logf passes scenario logs to t and, with scaleAtBaseline, makes the HPA
-// scale up exactly when the negative-control window opens, so the window's
-// first observation sees it regardless of scheduling delays.
+// scale up exactly when the negative-control window opens.
 func (k *simCluster) logf(t *testing.T) func(string, ...any) {
 	return func(format string, args ...any) {
 		t.Logf(format, args...)
@@ -2012,8 +1947,7 @@ func TestHPAScenario(t *testing.T) {
 			breakIt: func(k *simCluster) { k.settleReplacePod = true }},
 		{name: "HPA records each new average after a delay", mode: allocationModeDRA,
 			breakIt: func(k *simCluster) { k.recordedLag = 100 * time.Millisecond }},
-		// Regression for exact phase matching: scaling decisions that are
-		// not reflected in the HPA's recorded metric must not pass.
+		// The recorded average must be the current phase's value.
 		{name: "HPA records another phase's below-target average", mode: allocationModeDevicePlugin,
 			breakIt: func(k *simCluster) { k.recordedStaleBelow = true }, wantErr: "recorded average 1 for \"m\", want the current value 2"},
 		{name: "HPA controller cannot read the metric", mode: allocationModeDevicePlugin,
@@ -2041,24 +1975,22 @@ func TestHPAScenario(t *testing.T) {
 		// removed replica; under DRA its still-allocated claim fails the run.
 		{name: "removed Pods are left behind as Failed, holding their claims", mode: allocationModeDRA,
 			breakIt: func(k *simCluster) { k.removal = removeLeftFailed }, wantErr: "still allocated for removed Pods: hpa-workload-2-claim"},
-		// Regression: Pod lifecycle events outside autoscaling must not fail
-		// a conforming HPA.
+		// Pod lifecycle events outside autoscaling must not fail a
+		// conforming HPA.
 		{name: "scale-down replaces Pods instead of removing them", mode: allocationModeDevicePlugin,
 			breakIt: func(k *simCluster) { k.replaceOnShrink = true }},
 		{name: "node evicts a Pod during scale-down (DRA)", mode: allocationModeDRA,
 			breakIt: func(k *simCluster) { k.evictOnScaleDown = true }},
 		{name: "node evicts a Pod during scale-down (device plugin)", mode: allocationModeDevicePlugin,
 			breakIt: func(k *simCluster) { k.evictOnScaleDown = true }},
-		// Regression: a Pod evicted through the eviction API during the
-		// scale-down, and still terminating when the HPA has scaled down
-		// (e.g. its node stopped responding), failed the run as if the
-		// scale-down had not removed its replica.
 		{name: "evicted Pod still terminating after scale-down (DRA)", mode: allocationModeDRA,
 			breakIt: func(k *simCluster) { k.disruptOnScaleDown = true }},
 		{name: "evicted Pod still terminating after scale-down (device plugin)", mode: allocationModeDevicePlugin,
 			breakIt: func(k *simCluster) { k.disruptOnScaleDown = true }},
-		// Regression: scaled-up Pods the node rejected are terminal, so they
-		// were missed by the prerequisite check and reported as FAIL.
+		// Pods the node rejected are terminal, but still an environment
+		// problem.
+		{name: "scaled-up Pods share one ResourceClaim", mode: allocationModeDRA,
+			breakIt: func(k *simCluster) { k.shareFirstClaim = true }, wantErr: "ResourceClaim hpa-workload-1-claim was not generated for Pod hpa-workload-2"},
 		{name: "scaled-up Pods rejected at admission", mode: allocationModeDevicePlugin,
 			breakIt: func(k *simCluster) { k.admissionFailure = true }, wantEnv: true, wantErr: "failed (UnexpectedAdmissionError: Allocate failed"},
 		{name: "removed Pods keep their DRA claims", mode: allocationModeDRA,
@@ -2148,8 +2080,6 @@ func TestHPACleanup(t *testing.T) {
 	fastHPATiming(t)
 	ctx := context.Background()
 
-	// Regression: deletes ran without a deadline, so an API server that
-	// never answered blocked cleanup forever.
 	t.Run("bounded when the API server does not answer", func(t *testing.T) {
 		s := newHPAScenario(hpaUnresponsiveServer(t), "ns", allocationModeDevicePlugin, "v1beta2", nvidiaConfig(t), testHPAConfig(t, time.Second), t.Logf)
 		start := time.Now()
@@ -2169,8 +2099,6 @@ func TestHPACleanup(t *testing.T) {
 		}
 	})
 
-	// Regression: a failed HPA delete returned before the Deployment, and
-	// so its accelerator Pods, were deleted.
 	t.Run("continues after a failed step and reports it", func(t *testing.T) {
 		c := fake.NewClientset(
 			&autoscalingv2.HorizontalPodAutoscaler{ObjectMeta: metav1.ObjectMeta{Name: hpaWorkloadName, Namespace: "ns"}},
@@ -2179,7 +2107,7 @@ func TestHPACleanup(t *testing.T) {
 		c.PrependReactor("delete", "horizontalpodautoscalers", func(k8stesting.Action) (bool, runtime.Object, error) {
 			return true, nil, apierrors.NewForbidden(schema.GroupResource{Group: "autoscaling", Resource: "horizontalpodautoscalers"}, hpaWorkloadName, errors.New("denied"))
 		})
-		s := newHPAScenario(c, "ns", allocationModeDevicePlugin, "v1beta2", nvidiaConfig(t), testHPAConfig(t, time.Second), t.Logf)
+		s := testHPAScenario(t, c)
 		err := s.cleanup(ctx)
 		if !apierrors.IsForbidden(err) || !strings.Contains(err.Error(), "delete HorizontalPodAutoscaler") {
 			t.Fatalf("error = %v, want the failed HPA delete reported", err)
@@ -2235,15 +2163,13 @@ func TestHoldStatePermanentAPIError(t *testing.T) {
 	c.PrependReactor("get", "horizontalpodautoscalers", func(k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "horizontalpodautoscalers"}, "x", errors.New("denied"))
 	})
-	s := newHPAScenario(c, "ns", allocationModeDevicePlugin, "v1beta2", nvidiaConfig(t), testHPAConfig(t, time.Second), t.Logf)
+	s := testHPAScenario(t, c)
 	_, err := s.holdState(context.Background(), time.Second, func(context.Context, hpaState) error { return nil })
 	if !isHPAEnvironmentError(err) || !apierrors.IsForbidden(err) {
 		t.Fatalf("error = %q, want an environment error wrapping Forbidden", hpaFailureMessage(err))
 	}
 }
 
-// Regression: an outage in the middle of the negative-control window went
-// unnoticed if the window's last observation succeeded.
 func TestHoldStateRequiresObservationThroughoutTheWindow(t *testing.T) {
 	fastHPATiming(t)
 	c := fake.NewClientset(&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: hpaWorkloadName, Namespace: "ns"}})
@@ -2254,7 +2180,7 @@ func TestHoldStateRequiresObservationThroughoutTheWindow(t *testing.T) {
 		}
 		return false, nil, nil
 	})
-	s := newHPAScenario(c, "ns", allocationModeDevicePlugin, "v1beta2", nvidiaConfig(t), testHPAConfig(t, time.Second), t.Logf)
+	s := testHPAScenario(t, c)
 	_, err := s.holdState(context.Background(), time.Second, func(context.Context, hpaState) error { return nil })
 	if !isHPAEnvironmentError(err) || !strings.Contains(err.Error(), "could not observe the HPA for") {
 		t.Fatalf("holdState with an unobserved gap returned %v, want an environment error", err)
@@ -2267,7 +2193,7 @@ func TestHoldStateRequiresAFinalObservation(t *testing.T) {
 	c.PrependReactor("get", "horizontalpodautoscalers", func(k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, apierrors.NewServiceUnavailable("apiserver overloaded")
 	})
-	s := newHPAScenario(c, "ns", allocationModeDevicePlugin, "v1beta2", nvidiaConfig(t), testHPAConfig(t, time.Second), t.Logf)
+	s := testHPAScenario(t, c)
 	_, err := s.holdState(context.Background(), 20*time.Millisecond, func(context.Context, hpaState) error { return nil })
 	if !isHPAEnvironmentError(err) || !strings.Contains(err.Error(), "could not observe") {
 		t.Fatalf("holdState with no successful observation returned %v, want an error", err)
