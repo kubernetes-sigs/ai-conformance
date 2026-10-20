@@ -5,6 +5,7 @@ To run these AI Conformance tests, you must have:
 - Kubeconfig: A valid kubeconfig file with cluster-admin permissions for the target cluster.
 - Accelerator Node Pool: The cluster must have nodes with accelerators exposed through the Kubernetes resource management framework — either a DRA driver (ResourceClaims against a DeviceClass such as `gpu.nvidia.com`) or a device plugin (extended resources such as `nvidia.com/gpu`). Make sure your nodes allow testing pods to be scheduled on them (e.g. no taints that prevent scheduling).
 - Cluster Autoscaling Test: `TestAcceleratorClusterAutoscaling` additionally requires a running cluster autoscaler and an isolated accelerator pool with minimum size `N >= 1`, maximum size at least `N+1`, effective capacity for exactly one requested accelerator per baseline node, scale-down enabled, sufficient cloud quota/stock, and one stable node label inherited by new pool nodes. The pool must contain no non-DaemonSet workloads or other Pending Pods explicitly selecting the pool. Device-plugin mode permits unrelated running accelerator workloads outside the pool but rejects other Pending Pods requesting the configured extended resource. DRA mode requires no other active Pods with ResourceClaims or allocated ResourceClaims outside the test namespace while the test runs because DRA devices may use shared topology.
+- AI Service Metrics Test: `TestAIServiceMetrics` needs no accelerator. It requires a monitoring system with a Prometheus-compatible query API, the ability to pull the public `python:3.13-alpine` image, and room to schedule one small Pod (50m CPU, 64Mi memory request).
 - Workload Sandboxing Test: `TestWorkloadSandboxing` requires a sandboxed `RuntimeClass` (e.g. gVisor or Kata Containers) and is skipped if none is detected. The node that runs the sandboxed workload must also admit a plain, unsandboxed pod pinned to it (the test's control pod).
 - HPA Autoscaling Test: `TestHPAAutoscaling` additionally requires capacity to allocate `-hpa-max-replicas` accelerators (default 2, at least 2) to the test at the same time, one per Pod, plus 50m CPU and 64Mi memory per Pod, a custom metrics pipeline configured as described in [HPA Autoscaling for AI Workloads](#hpa-autoscaling-for-ai-workloads), and the ability to pull `docker.io/library/python:3.13-alpine` (or a mirror of it set with `-hpa-workload-image`).
 - Network Access: The test machine must be able to reach the Kubernetes API server.
@@ -36,6 +37,7 @@ go test -v -short ./test
 | `TestGangScheduling` | Gang Scheduling | MUST |
 | `TestAcceleratorClusterAutoscaling` | Effective Cluster Autoscaling for Accelerators | MUST |
 | `TestRobustCRDControllerOperation` | Robust CRD and Controller Operation | MUST |
+| `TestAIServiceMetrics` | AI Job & Inference Service Metrics | MUST |
 | `TestWorkloadSandboxing` | Workload Sandboxing for Untrusted Code | SHOULD |
 | `TestHPAAutoscaling` | Effective HPA Autoscaling for AI Workloads | MUST |
 
@@ -191,6 +193,25 @@ go test -v ./test -run TestHPAAutoscaling -timeout 75m -args \
 Add `-hpa-pod-annotations=prometheus.io/scrape=true` (or whatever your discovery needs) if your pipeline discovers Pods by annotation, `-allocation-mode=dra` or `-allocation-mode=device-plugin` to require a specific mechanism, and `-hpa-workload-image` to pull the workload image from a mirror.
 
 Each wait is bounded by a flag: `-hpa-scale-up-timeout` (default 10m) for the baseline Pod becoming Ready and, separately, for the scale-up, which `-hpa-metric-timeout` extends so the new Pods can become Ready and report the raised metric; `-hpa-metric-timeout` (default 5m) also for each time a metric change must reach the custom metrics API, and for the HPA's first reconcile; and `-hpa-scale-down-timeout` (default 10m, which must exceed `-hpa-scale-down-stabilization`, default 1m) after the lowered metric is reported. The negative control lasts one minute, or up to two if the API server does not answer at its end. With the defaults the test therefore runs for at most about 52 minutes, then cleanup takes at most 7 (5 for the workload, 2 for the namespace). Use `-timeout 75m`, and raise it by as much as you raise these flags. The test stops 10 minutes before the `go test` deadline so that its cleanup still runs (a `go test` timeout would otherwise end the process without cleanup, leaving the Pods and their accelerators allocated), and it fails at once if `-timeout` leaves less than that, as Go's 10-minute default does.
+
+### AI Job & Inference Service Metrics
+
+The metrics test deploys a small workload that exposes Prometheus metrics, sends it a fixed number of requests, and verifies that the platform's monitoring system collects the workload's metrics and that the collected request count increases by exactly the number of requests sent.
+
+The test is **skipped by default**. Point it at the monitoring system's Prometheus-compatible query API with exactly one of:
+
+- `-service-metrics-prometheus-service=<namespace>/<name>:<port>`: an in-cluster Service, reached through the API server service proxy (no port-forward needed).
+- `-service-metrics-query-url=<url>`: any reachable query endpoint, including any path prefix (e.g. `https://mimir.example/prometheus`), optionally with `-service-metrics-query-bearer-token-file`, `-service-metrics-query-headers` (e.g. a tenant header like `X-Scope-OrgID=<tenant>`) and `-service-metrics-query-ca-file` for a private CA.
+
+By default the test creates a `monitoring.coreos.com/v1` `ServiceMonitor`. Use `-service-metrics-scrape-labels` if your Prometheus only selects labeled ServiceMonitors (for kube-prometheus-stack: `release=<helm release name>`). If your platform discovers scrape targets another way, pass a templated manifest with `-service-metrics-scrape-manifest`; run `go test ./test -args -help` for the available template fields. In a custom manifest, set the scrape interval to `{{.ScrapeInterval}}`. With a longer interval or ingestion delay, raise `-service-metrics-collection-timeout`, which bounds each of the two waits (before and after traffic).
+
+Example with kube-prometheus-stack:
+
+```bash
+go test -v ./test -run TestAIServiceMetrics -args \
+  -service-metrics-prometheus-service=monitoring/prometheus-operated:9090 \
+  -service-metrics-scrape-labels=release=kube-prometheus-stack
+```
 
 ## Vendor Customization & Neutrality
 

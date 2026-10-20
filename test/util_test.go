@@ -965,6 +965,7 @@ func isRetryableAPIError(err error) bool {
 		apierrors.IsTooManyRequests(err) ||
 		apierrors.IsServiceUnavailable(err) ||
 		apierrors.IsInternalError(err) ||
+		utilnet.IsTimeout(err) ||
 		utilnet.IsProbableEOF(err) ||
 		utilnet.IsConnectionReset(err) ||
 		utilnet.IsHTTP2ConnectionLost(err)
