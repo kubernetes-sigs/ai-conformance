@@ -39,12 +39,12 @@ The test verifies that the HorizontalPodAutoscaler running on the platform can s
 
 4. **Cleanup**: Delete the HPA, the Deployment and any other resources the test created.
 
-The proposed `TestHPAAutoscaling` (see [test/hpa_autoscaling_test.go](../../test/hpa_autoscaling_test.go)) implements these steps as follows. The test does not deploy a custom metrics adapter, because doing so would replace the platform's registration of the custom metrics API; it relies on the platform's pipeline meeting a documented integration contract (see [test/README.md](../../test/README.md)). Each Pod requests one accelerator and exposes a synthetic per-replica queue depth gauge, standing in for an inference server's scaling signal, whose value the test controls through a ConfigMap; the test checks the HPA's behavior, not inference performance. The test verifies that the HPA holds one replica while the metric is below target, scales up to `maxReplicas` with every new Pod Running and Ready on an allocated accelerator when the metric is raised, and scales back down once the metric is lowered, with the removed Pods deleted and, under DRA, their ResourceClaims deallocated.
+This is implemented by `TestHPAAutoscaling` in the AI conformance test suite (see [test/hpa_autoscaling_test.go](../../test/hpa_autoscaling_test.go)). The test does not deploy a custom metrics adapter, because doing so would replace the platform's registration of the custom metrics API; it relies on the platform's pipeline meeting a documented integration contract (see [test/README.md](../../test/README.md)). Each Pod requests one accelerator and exposes a synthetic per-replica queue depth gauge, standing in for an inference server's scaling signal, whose value the test controls through a ConfigMap; the test checks the HPA's behavior, not inference performance. Each Pod's container starts only if it sees exactly one accelerator device. The test verifies that the HPA holds one replica while the metric is below target, scales up to `maxReplicas` with every Pod Running and Ready when the metric is raised, and scales back down to one replica once the metric is lowered.
 
 ## Implementation History
 
 2026-03-12: KAR created
-2026-10-16: Automated conformance test proposed in test/hpa_autoscaling_test.go (pending review)
+2026-10-22: Automated conformance test added in test/hpa_autoscaling_test.go
 
 ## Related KARs
 

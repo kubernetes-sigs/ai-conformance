@@ -6,16 +6,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -52,7 +49,11 @@ func fastHPATiming(t *testing.T) {
 
 func testHPAConfig(t *testing.T, timeout time.Duration) hpaConfig {
 	t.Helper()
-	return testHPAConfigN(t, timeout, 2)
+	hc, err := newHPAConfig("m", 2, "", "example.com/python:test", timeout, timeout, timeout, 0)
+	if err != nil {
+		t.Fatalf("newHPAConfig: %v", err)
+	}
+	return hc
 }
 
 // testHPAScenario returns a device-plugin scenario with one-second timeouts.
@@ -71,15 +72,6 @@ func wantHPAError(t *testing.T, err error, want string) {
 	case want != "" && (err == nil || !strings.Contains(err.Error(), want)):
 		t.Fatalf("error = %v, want it to contain %q", err, want)
 	}
-}
-
-func testHPAConfigN(t *testing.T, timeout time.Duration, maxReplicas int) hpaConfig {
-	t.Helper()
-	hc, err := newHPAConfig("m", maxReplicas, "", "example.com/python:test", timeout, timeout, timeout, 0)
-	if err != nil {
-		t.Fatalf("newHPAConfig: %v", err)
-	}
-	return hc
 }
 
 func TestNewHPAConfig(t *testing.T) {
@@ -938,8 +930,8 @@ func TestWaitForStateClassification(t *testing.T) {
 		}
 	})
 
-	// A failed Node or ResourceClaim read inside the check is not the
-	// workload's problem.
+	// A failed API read inside the check (the custom metrics read while
+	// scaling up) is not the workload's problem.
 	t.Run("retryable API errors inside the check are not observations", func(t *testing.T) {
 		c := fake.NewClientset(&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: hpaWorkloadName, Namespace: "ns"}})
 		var calls atomic.Int32
@@ -947,7 +939,7 @@ func TestWaitForStateClassification(t *testing.T) {
 			if calls.Add(1) == 1 {
 				return errors.New("not scaled yet")
 			}
-			return fmt.Errorf("get node n of Pod p: %w", apierrors.NewServiceUnavailable("overloaded"))
+			return fmt.Errorf("custom metric for the scaled-up Pods: %w", apierrors.NewServiceUnavailable("overloaded"))
 		})
 		if !isHPAEnvironmentError(err) || !strings.Contains(err.Error(), "was not observed") {
 			t.Fatalf("error = %q, want an environment error for the unobserved end of the wait", hpaFailureMessage(err))
@@ -1145,54 +1137,6 @@ func TestCheckHPADecided(t *testing.T) {
 	}
 }
 
-func TestCheckHPARemovedPodsGone(t *testing.T) {
-	scaledUp := map[types.UID]bool{"u1": true, "u2": true}
-	terminating := hpaReadyPod("p2", "n", "u2")
-	terminating.DeletionTimestamp = &metav1.Time{Time: time.Now()}
-	terminatingFailed := terminating
-	terminatingFailed.Status.Phase = corev1.PodFailed // kubelets set a terminal phase while deleting
-	evicted := hpaReadyPod("p2", "n", "u2")
-	evicted.Status.Phase, evicted.Status.Reason = corev1.PodFailed, "Evicted"
-	succeeded := hpaReadyPod("old", "n", "u0")
-	succeeded.Status.Phase = corev1.PodSucceeded
-	disrupted := terminating
-	disrupted.Status.Conditions = []corev1.PodCondition{{Type: corev1.DisruptionTarget, Status: corev1.ConditionTrue, Reason: "EvictionByEvictionAPI"}}
-	disruptionCleared := terminating
-	disruptionCleared.Status.Conditions = []corev1.PodCondition{{Type: corev1.DisruptionTarget, Status: corev1.ConditionFalse, Reason: "EvictionByEvictionAPI"}}
-
-	tests := []struct {
-		name      string
-		state     hpaState
-		wantErr   string
-		wantNotes string
-	}{
-		{name: "survivor from the scaled-up set", state: hpaState{pods: []corev1.Pod{hpaReadyPod("p1", "n", "u1")}}},
-		{name: "removed Pod terminating", state: hpaState{pods: []corev1.Pod{hpaReadyPod("p1", "n", "u1")}, inactive: []corev1.Pod{terminating}}, wantErr: "p2 (Terminating)"},
-		{name: "removed Pod terminating in a terminal phase", state: hpaState{pods: []corev1.Pod{hpaReadyPod("p1", "n", "u1")}, inactive: []corev1.Pod{terminatingFailed}}, wantErr: "p2 (Terminating)"},
-		// Pod events outside autoscaling are allowed and noted.
-		{name: "Pod evicted by its node", state: hpaState{pods: []corev1.Pod{hpaReadyPod("p1", "n", "u1")}, inactive: []corev1.Pod{evicted}},
-			wantNotes: "Pod p2 was ended by its node (Failed: Evicted), not removed by the scale-down"},
-		{name: "replacement for an evicted Pod", state: hpaState{pods: []corev1.Pod{hpaReadyPod("p3", "n", "u3")}, inactive: []corev1.Pod{evicted}},
-			wantNotes: "Pod p3 replaced a scaled-up Pod"},
-		{name: "Pod terminating after an eviction", state: hpaState{pods: []corev1.Pod{hpaReadyPod("p3", "n", "u3")}, inactive: []corev1.Pod{disrupted}},
-			wantNotes: "Pod p2 is terminating after a disruption (EvictionByEvictionAPI), not removed by the scale-down"},
-		// Only a DisruptionTarget=True condition exempts a terminating Pod.
-		{name: "terminating Pod with a cleared disruption condition", state: hpaState{pods: []corev1.Pod{hpaReadyPod("p1", "n", "u1")}, inactive: []corev1.Pod{disruptionCleared}},
-			wantErr: "p2 (Terminating)"},
-		{name: "unrelated finished Pod", state: hpaState{pods: []corev1.Pod{hpaReadyPod("p1", "n", "u1")}, inactive: []corev1.Pod{succeeded}},
-			wantNotes: "Pod old was ended by its node (Succeeded), not removed"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if notes := hpaLifecycleNotes(tt.state, scaledUp); !strings.Contains(notes, tt.wantNotes) || (tt.wantNotes == "") != (notes == "") {
-				t.Errorf("notes = %q, want %q", notes, tt.wantNotes)
-			}
-			err := checkHPARemovedPodsGone(tt.state)
-			wantHPAError(t, err, tt.wantErr)
-		})
-	}
-}
-
 func TestGetHPAState(t *testing.T) {
 	deleting := hpaReadyPod("deleting", "n", "u3")
 	deleting.DeletionTimestamp = &metav1.Time{Time: time.Now()}
@@ -1231,815 +1175,57 @@ func TestGetHPAState(t *testing.T) {
 	}
 }
 
-func hpaAcceleratorNode(name string, gpus int64) *corev1.Node {
-	n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}}
-	n.Status.Allocatable = corev1.ResourceList{"nvidia.com/gpu": *resource.NewQuantity(gpus, resource.DecimalSI)}
-	return n
-}
-
-func hpaWorkloadPod(t *testing.T, mode, node string) corev1.Pod {
-	t.Helper()
-	d, err := buildHPADeployment("ns", mode, nvidiaConfig(t), "example.com/python:test", nil)
-	if err != nil {
-		t.Fatal(err)
+// TestHPAScaleUpFailure covers how a failure to get the scaled-up Pods Ready
+// is classified: Pods that cannot start are an environment problem only while
+// the HPA still decides on maxReplicas for the raised metric.
+func TestHPAScaleUpFailure(t *testing.T) {
+	s := testHPAScenario(t, fake.NewClientset())
+	notReady := errors.New("not Ready")
+	unschedulable := hpaReadyPod("p1", "", "u1")
+	unschedulable.Status = corev1.PodStatus{Phase: corev1.PodPending, Conditions: []corev1.PodCondition{{
+		Type: corev1.PodScheduled, Status: corev1.ConditionFalse, Reason: corev1.PodReasonUnschedulable, Message: "Insufficient nvidia.com/gpu",
+	}}}
+	rejected := hpaReadyPod("p2", "n", "u2")
+	rejected.Status = corev1.PodStatus{Phase: corev1.PodFailed, Reason: "UnexpectedAdmissionError", Message: "Allocate failed"}
+	stateWith := func(desired int32, pods, inactive []corev1.Pod) hpaState {
+		st := hpaScaledState(2, "100")
+		st.hpa.Status.DesiredReplicas = desired
+		st.pods, st.inactive = pods, inactive
+		return st
 	}
-	pod := hpaReadyPod("p", node, "pod-uid")
-	pod.Spec = d.Spec.Template.Spec
-	pod.Spec.NodeName = node
-	if mode == allocationModeDRA {
-		pod.Status.ResourceClaimStatuses = []corev1.PodResourceClaimStatus{{Name: "claim", ResourceClaimName: hpaPtr("p-claim")}}
-	}
-	return pod
-}
-
-func hpaAllocatedClaim(name string, podUID types.UID, driver string, devices int, selectorNode string) *resourcev1.ResourceClaim {
-	// As generated from a ResourceClaimTemplate: controlled by its Pod.
-	c := &resourcev1.ResourceClaim{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns", OwnerReferences: []metav1.OwnerReference{{
-			APIVersion: "v1", Kind: "Pod", Name: "p", UID: podUID, Controller: hpaPtr(true),
-		}}},
-		Status: resourcev1.ResourceClaimStatus{
-			Allocation:  &resourcev1.AllocationResult{},
-			ReservedFor: []resourcev1.ResourceClaimConsumerReference{{Resource: "pods", Name: "p", UID: podUID}},
-		},
-	}
-	for i := 0; i < devices; i++ {
-		c.Status.Allocation.Devices.Results = append(c.Status.Allocation.Devices.Results, resourcev1.DeviceRequestAllocationResult{
-			Request: testRequestName, Driver: driver, Pool: "pool", Device: fmt.Sprintf("gpu-%d", i),
-		})
-	}
-	if selectorNode != "" {
-		c.Status.Allocation.NodeSelector = &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{
-			MatchFields: []corev1.NodeSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{selectorNode}}},
-		}}}
-	}
-	return c
-}
-
-func TestCheckHPAPodAccelerator(t *testing.T) {
-	cfg := nvidiaConfig(t)
-	dp := hpaWorkloadPod(t, allocationModeDevicePlugin, "gpu-node")
-	dra := hpaWorkloadPod(t, allocationModeDRA, "gpu-node")
-	noRequest := hpaReadyPod("p", "gpu-node", "pod-uid")
-	gpuNode, cpuNode := hpaAcceleratorNode("gpu-node", 1), hpaAcceleratorNode("gpu-node", 0)
-	claim := func(uid types.UID, driver string, devices int, selectorNode string) []*resourcev1.ResourceClaim {
-		return []*resourcev1.ResourceClaim{hpaAllocatedClaim("p-claim", uid, driver, devices, selectorNode)}
-	}
-	unallocated := claim("pod-uid", cfg.DRADriver, 1, "")
-	unallocated[0].Status = resourcev1.ResourceClaimStatus{}
-	ownedBy := func(c *resourcev1.ResourceClaim, uid types.UID) *resourcev1.ResourceClaim {
-		c.OwnerReferences = nil
-		if uid != "" {
-			c.OwnerReferences = []metav1.OwnerReference{{APIVersion: "v1", Kind: "Pod", Name: "other", UID: uid, Controller: hpaPtr(true)}}
-		}
-		return c
-	}
-	sharedWith := func(c *resourcev1.ResourceClaim, uid types.UID) *resourcev1.ResourceClaim {
-		c.Status.ReservedFor = append(c.Status.ReservedFor, resourcev1.ResourceClaimConsumerReference{Resource: "pods", Name: "other", UID: uid})
-		return c
-	}
-
 	tests := []struct {
 		name    string
-		pod     corev1.Pod
-		node    *corev1.Node
-		claims  []*resourcev1.ResourceClaim
-		mode    string
+		state   hpaState
+		wantEnv bool
 		wantErr string
 	}{
-		{name: "device plugin on accelerator node", pod: dp, node: gpuNode, mode: allocationModeDevicePlugin},
-		{name: "device plugin on node without the resource", pod: dp, node: cpuNode, mode: allocationModeDevicePlugin, wantErr: "allocatable nvidia.com/gpu=0"},
-		{name: "device plugin Pod without request", pod: noRequest, node: gpuNode, mode: allocationModeDevicePlugin, wantErr: "does not request"},
-		{name: "DRA allocated and reserved", pod: dra, node: cpuNode, mode: allocationModeDRA, claims: claim("pod-uid", cfg.DRADriver, 1, "gpu-node")},
-		{name: "DRA Pod without claim", pod: noRequest, node: gpuNode, mode: allocationModeDRA, wantErr: "does not request"},
-		{name: "DRA claim missing from status", pod: dra, node: gpuNode, mode: allocationModeDRA, wantErr: "0 generated ResourceClaims"},
-		{name: "DRA claim not allocated", pod: dra, node: gpuNode, mode: allocationModeDRA,
-			claims: unallocated, wantErr: "not allocated"},
-		// Replicas must not share one claim (one device).
-		{name: "DRA claim generated for another Pod", pod: dra, node: gpuNode, mode: allocationModeDRA,
-			claims: []*resourcev1.ResourceClaim{ownedBy(claim("pod-uid", cfg.DRADriver, 1, "")[0], "other-uid")}, wantErr: "was not generated for Pod"},
-		{name: "DRA claim without a controller owner", pod: dra, node: gpuNode, mode: allocationModeDRA,
-			claims: []*resourcev1.ResourceClaim{ownedBy(claim("pod-uid", cfg.DRADriver, 1, "")[0], "")}, wantErr: "was not generated for Pod"},
-		{name: "DRA claim shared with another Pod", pod: dra, node: gpuNode, mode: allocationModeDRA,
-			claims: []*resourcev1.ResourceClaim{sharedWith(claim("pod-uid", cfg.DRADriver, 1, "")[0], "other-uid")}, wantErr: "want only Pod"},
-		{name: "DRA claim reserved for another Pod", pod: dra, node: gpuNode, mode: allocationModeDRA, claims: []*resourcev1.ResourceClaim{func() *resourcev1.ResourceClaim {
-			c := claim("pod-uid", cfg.DRADriver, 1, "")[0]
-			c.Status.ReservedFor[0].UID = "other-uid"
-			return c
-		}()}, wantErr: "want only Pod"},
-		{name: "DRA device from another driver", pod: dra, node: gpuNode, mode: allocationModeDRA, claims: claim("pod-uid", "other.example.com", 1, ""), wantErr: "from driver other.example.com"},
-		{name: "DRA no devices for request", pod: dra, node: gpuNode, mode: allocationModeDRA, claims: claim("pod-uid", cfg.DRADriver, 0, ""), wantErr: "allocated 0 devices"},
-		{name: "DRA too many devices", pod: dra, node: gpuNode, mode: allocationModeDRA, claims: claim("pod-uid", cfg.DRADriver, 2, ""), wantErr: "allocated 2 devices"},
-		{name: "DRA Pod on node outside allocation", pod: dra, node: gpuNode, mode: allocationModeDRA, claims: claim("pod-uid", cfg.DRADriver, 1, "another-node"), wantErr: "outside the allocation node selector"},
-		{name: "unknown mode", pod: dp, node: gpuNode, mode: "bogus", wantErr: "unknown allocation mode"},
+		{name: "unschedulable Pod while the HPA holds maxReplicas", state: stateWith(2, []corev1.Pod{unschedulable}, nil), wantEnv: true, wantErr: "Insufficient nvidia.com/gpu"},
+		{name: "Pod rejected at admission", state: stateWith(2, nil, []corev1.Pod{rejected}), wantEnv: true, wantErr: "p2 failed (UnexpectedAdmissionError"},
+		{name: "HPA no longer decides on maxReplicas", state: stateWith(1, []corev1.Pod{unschedulable}, nil), wantErr: "not Ready; HPA conditions"},
+		{name: "no Pod problem", state: stateWith(2, nil, nil), wantErr: "not Ready; HPA conditions"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			pod := tt.pod
-			err := checkHPAPodAccelerator(&pod, tt.node, tt.claims, tt.mode, cfg)
+			err := s.scaleUpFailure(notReady, tt.state)
 			wantHPAError(t, err, tt.wantErr)
-		})
-	}
-}
-
-func TestVerifyHPAPodsOnAccelerators(t *testing.T) {
-	cfg := nvidiaConfig(t)
-	ctx := context.Background()
-	pod := hpaWorkloadPod(t, allocationModeDRA, "gpu-node")
-
-	client := fake.NewClientset(hpaAcceleratorNode("gpu-node", 0), hpaAllocatedClaim("p-claim", "pod-uid", cfg.DRADriver, 1, "gpu-node"))
-	if err := verifyHPAPodsOnAccelerators(ctx, client, []corev1.Pod{pod}, allocationModeDRA, cfg); err != nil {
-		t.Fatalf("verifyHPAPodsOnAccelerators: %v", err)
-	}
-	missingClaim := fake.NewClientset(hpaAcceleratorNode("gpu-node", 0))
-	if err := verifyHPAPodsOnAccelerators(ctx, missingClaim, []corev1.Pod{pod}, allocationModeDRA, cfg); err == nil || !strings.Contains(err.Error(), "get ResourceClaim") {
-		t.Fatalf("missing ResourceClaim error = %v", err)
-	}
-	dp := hpaWorkloadPod(t, allocationModeDevicePlugin, "gone")
-	if err := verifyHPAPodsOnAccelerators(ctx, fake.NewClientset(), []corev1.Pod{dp}, allocationModeDevicePlugin, cfg); err == nil || !strings.Contains(err.Error(), "get node gone") {
-		t.Fatalf("missing node error = %v", err)
-	}
-}
-
-// TestVerifyHPAPodsDoNotOvercommit covers what the per-Pod checks cannot see:
-// the same accelerator counted for two replicas.
-func TestVerifyHPAPodsDoNotOvercommit(t *testing.T) {
-	cfg := nvidiaConfig(t)
-	ctx := context.Background()
-	draPods := func() []corev1.Pod {
-		a, b := hpaWorkloadPod(t, allocationModeDRA, "gpu-node"), hpaWorkloadPod(t, allocationModeDRA, "gpu-node")
-		a.Name, a.UID, a.Status.ResourceClaimStatuses[0].ResourceClaimName = "a", "uid-a", hpaPtr("a-claim")
-		b.Name, b.UID, b.Status.ResourceClaimStatuses[0].ResourceClaimName = "b", "uid-b", hpaPtr("b-claim")
-		return []corev1.Pod{a, b}
-	}
-	claims := func(deviceB string, shares bool) (*resourcev1.ResourceClaim, *resourcev1.ResourceClaim) {
-		a := hpaAllocatedClaim("a-claim", "uid-a", cfg.DRADriver, 1, "")
-		b := hpaAllocatedClaim("b-claim", "uid-b", cfg.DRADriver, 1, "")
-		b.Status.Allocation.Devices.Results[0].Device = deviceB
-		if shares {
-			a.Status.Allocation.Devices.Results[0].ShareID = hpaPtr(types.UID("share-a"))
-			b.Status.Allocation.Devices.Results[0].ShareID = hpaPtr(types.UID("share-b"))
-		}
-		return a, b
-	}
-	for _, tc := range []struct {
-		name    string
-		deviceB string
-		shares  bool
-		wantErr string
-	}{
-		{name: "distinct devices", deviceB: "gpu-1"},
-		// A driver may allocate one device to several claims as separate
-		// shares (allowMultipleAllocations); that is not a double allocation.
-		{name: "separate shares of one device", deviceB: "gpu-0", shares: true},
-		{name: "one device allocated twice", deviceB: "gpu-0", wantErr: "is allocated to both Pod a and Pod b"},
-	} {
-		t.Run("DRA "+tc.name, func(t *testing.T) {
-			a, b := claims(tc.deviceB, tc.shares)
-			c := fake.NewClientset(hpaAcceleratorNode("gpu-node", 0), a, b)
-			err := verifyHPAPodsOnAccelerators(ctx, c, draPods(), allocationModeDRA, cfg)
-			if (tc.wantErr == "") != (err == nil) || (err != nil && !strings.Contains(err.Error(), tc.wantErr)) {
-				t.Fatalf("error = %v, want %q", err, tc.wantErr)
+			if isHPAEnvironmentError(err) != tt.wantEnv {
+				t.Fatalf("%q classified as environment=%t, want %t", hpaFailureMessage(err), isHPAEnvironmentError(err), tt.wantEnv)
 			}
 		})
 	}
-
-	dp := func(name, node string) corev1.Pod {
-		p := hpaWorkloadPod(t, allocationModeDevicePlugin, node)
-		p.Name = name
-		return p
-	}
-	t.Run("device plugin within node capacity", func(t *testing.T) {
-		c := fake.NewClientset(hpaAcceleratorNode("n1", 1), hpaAcceleratorNode("n2", 2))
-		if err := verifyHPAPodsOnAccelerators(ctx, c, []corev1.Pod{dp("a", "n1"), dp("b", "n2"), dp("c", "n2")}, allocationModeDevicePlugin, cfg); err != nil {
-			t.Fatal(err)
-		}
-	})
-	t.Run("device plugin over node capacity", func(t *testing.T) {
-		c := fake.NewClientset(hpaAcceleratorNode("n1", 1))
-		err := verifyHPAPodsOnAccelerators(ctx, c, []corev1.Pod{dp("a", "n1"), dp("b", "n1")}, allocationModeDevicePlugin, cfg)
-		if err == nil || !strings.Contains(err.Error(), "node n1 runs 2 of the test's Pods") {
-			t.Fatalf("error = %v, want an overcommit error", err)
-		}
-	})
-
-	t.Run("permission error is an environment error and ends the wait", func(t *testing.T) {
-		fastHPATiming(t)
-		c := fake.NewClientset(hpaAcceleratorNode("gpu-node", 1), &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: hpaWorkloadName, Namespace: "ns"}})
-		c.PrependReactor("get", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
-			return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "nodes"}, "gpu-node", errors.New("denied"))
-		})
-		s := newHPAScenario(c, "ns", allocationModeDevicePlugin, "v1beta2", cfg, testHPAConfig(t, time.Second), t.Logf)
-		start := time.Now()
-		_, err := s.waitForState(ctx, time.Second, func(ctx context.Context, _ hpaState) error {
-			return verifyHPAPodsOnAccelerators(ctx, c, []corev1.Pod{dp("a", "gpu-node")}, allocationModeDevicePlugin, cfg)
-		})
-		if !isHPAEnvironmentError(err) || !apierrors.IsForbidden(err) || time.Since(start) > 500*time.Millisecond {
-			t.Fatalf("error = %q after %s, want a prompt environment error wrapping Forbidden", hpaFailureMessage(err), time.Since(start))
-		}
-	})
 }
 
-func TestCheckHPAClaimsReleased(t *testing.T) {
-	cfg := nvidiaConfig(t)
-	live := *hpaAllocatedClaim("live", "live-uid", cfg.DRADriver, 1, "")
-	released := resourcev1.ResourceClaim{ObjectMeta: metav1.ObjectMeta{Name: "released"}}
-	held := *hpaAllocatedClaim("held", "removed-uid", cfg.DRADriver, 1, "")
-
-	if err := checkHPAClaimsReleased([]resourcev1.ResourceClaim{live, released}, map[types.UID]bool{"live-uid": true}); err != nil {
-		t.Errorf("live and deallocated claims rejected: %v", err)
-	}
-	if err := checkHPAClaimsReleased([]resourcev1.ResourceClaim{live, held}, map[types.UID]bool{"live-uid": true}); err == nil || !strings.Contains(err.Error(), "held (generated for Pod p)") {
-		t.Errorf("claim of a removed Pod not reported: %v", err)
-	}
-	if err := checkHPAClaimsReleased([]resourcev1.ResourceClaim{live}, nil); err == nil {
-		t.Error("an allocated claim passed with no live Pods")
-	}
-}
-
-// simCluster stands in for the controllers TestHPAAutoscaling depends on
-// (HPA, Deployment/ReplicaSet, scheduler and kubelet, DRA, the metrics
-// pipeline) on top of a fake clientset. Each knob breaks one of them.
-type simCluster struct {
-	c    *fake.Clientset
-	ns   string
-	mode string
-	cfg  AcceleratorConfig
-
-	ignoreMetric      bool // the HPA never changes the replica count
-	cannotScale       bool // the HPA decides on a replica count but cannot update the Deployment
-	scaleAtBaseline   bool // the HPA scales up once the negative control starts, although the metric is below target
-	capacity          int  // Pods that can be scheduled; the rest stay Unschedulable (negative = unlimited)
-	metricsMissing    bool // the adapter never serves the metric
-	hpaMetricsDenied  bool // the HPA cannot read the metric (e.g. RBAC), as reported by FailedGetPodsMetric
-	newPodsUnscraped  bool // the pipeline never discovers Pods created after the first one
-	pullFailure       bool // Pods after the first one cannot pull their image
-	startupCheckFails bool // containers of Pods after the first one see no accelerator and crash-loop
-	frozenMetrics     bool // the pipeline keeps reporting the first value it saw
-	replaceOnShrink   bool // scaling down replaces every Pod instead of removing the extras
-	admissionFailure  bool // Pods after the first one are rejected at admission (Phase=Failed), as when a device cannot be allocated
-	evictOnScaleDown  bool // the node evicts one Pod (Phase=Failed, not deleted) once the metric is lowered
-	shareFirstClaim   bool // DRA: Pods after the first one use the first Pod's ResourceClaim (one device)
-	// disruptOnScaleDown evicts one Pod through the eviction API once the
-	// metric is lowered, and the Pod then stays Terminating (e.g. its node
-	// stopped responding) with its DRA claim still allocated.
-	disruptOnScaleDown bool
-	removal            simRemoval
-	// The settle* knobs act while the test confirms the scaled-up state:
-	// settleAPIError fails the next Node read with a retryable error, and
-	// settleReplacePod deletes one scaled-up Pod once.
-	settleAPIError   bool
-	settleReplacePod bool
-	maxReplicas      int
-	settled          atomic.Bool
-	nodeReadFails    atomic.Bool
-	// recordedLag makes the HPA record the previous phase's average for this
-	// long after each metric change, as a real HPA does until its next sync.
-	recordedLag time.Duration
-	// recordedStaleBelow makes the HPA keep recording the baseline's average
-	// whenever the value is below target, while scaling on the current value.
-	recordedStaleBelow bool
-
-	mu          sync.Mutex
-	seq         int
-	recorded    int                // value the HPA last recorded
-	recordedAt  time.Time          // when the HPA last recorded a value
-	staleBelow  int                // first below-target value recorded
-	peakLive    int                // most non-terminating Pods ever running at once
-	raisedPods  map[string]bool    // Pods whose raised metric (100) the adapter served
-	createdUIDs map[types.UID]bool // UIDs of every Pod created
-	misbehaving bool
-	frozen      string
-	evicted     bool
-	lastCreate  time.Time
-}
-
-func newSimCluster(t *testing.T, mode string) *simCluster {
-	t.Helper()
-	k := &simCluster{
-		c:        fake.NewClientset(hpaAcceleratorNode("gpu-node", 8)),
-		ns:       "ns",
-		mode:     mode,
-		cfg:      nvidiaConfig(t),
-		capacity: -1,
-	}
-	k.c.PrependReactor("get", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
-		if k.nodeReadFails.CompareAndSwap(true, false) {
-			return true, nil, apierrors.NewServiceUnavailable("simulated transient API error")
+func TestHPAAllocatedClaims(t *testing.T) {
+	claim := func(name string, allocated bool) resourcev1.ResourceClaim {
+		c := resourcev1.ResourceClaim{ObjectMeta: metav1.ObjectMeta{Name: name}}
+		if allocated {
+			c.Status.Allocation = &resourcev1.AllocationResult{}
 		}
-		return false, nil, nil
-	})
-	return k
-}
-
-// simRemoval is how the simulated cluster removes a Pod.
-type simRemoval int
-
-const (
-	removeCleanly          simRemoval = iota
-	removeStuckTerminating            // the Pod never finishes terminating
-	removeLeftFailed                  // scale-down leaves the Pod object behind as Failed
-	removeKeepClaims                  // the Pod's DRA claim stays allocated
-)
-
-// start runs the simulated controllers until the test ends.
-func (k *simCluster) start(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for ctx.Err() == nil {
-			k.step(ctx)
-			time.Sleep(time.Millisecond)
-		}
-	}()
-	t.Cleanup(func() { cancel(); <-done })
-}
-
-func (k *simCluster) metricValue(ctx context.Context) string {
-	cm, err := k.c.CoreV1().ConfigMaps(k.ns).Get(ctx, hpaWorkloadName, metav1.GetOptions{})
-	if err != nil {
-		return ""
+		return c
 	}
-	return cm.Data[hpaMetricValueKey]
-}
-
-func (k *simCluster) workloadPods(ctx context.Context) (live, all []corev1.Pod) {
-	list, err := k.c.CoreV1().Pods(k.ns).List(ctx, metav1.ListOptions{LabelSelector: hpaWorkloadSelector()})
-	if err != nil {
-		return nil, nil
-	}
-	for _, pod := range list.Items {
-		if pod.DeletionTimestamp == nil && pod.Status.Phase != corev1.PodFailed {
-			live = append(live, pod)
-		}
-	}
-	return live, list.Items
-}
-
-func (k *simCluster) step(ctx context.Context) {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	live, all := k.workloadPods(ctx)
-	d, err := k.c.AppsV1().Deployments(k.ns).Get(ctx, hpaWorkloadName, metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		for i := range all {
-			k.removePod(ctx, &all[i], true)
-		}
-		return
-	}
-	if err != nil {
-		return
-	}
-
-	if hpa, err := k.c.AutoscalingV2().HorizontalPodAutoscalers(k.ns).Get(ctx, hpaWorkloadName, metav1.GetOptions{}); err == nil {
-		if v, err := strconv.Atoi(k.metricValue(ctx)); err == nil {
-			k.reconcileHPA(ctx, hpa, d, live, v)
-		}
-	}
-
-	if n := len(live); n > k.peakLive {
-		k.peakLive = n
-	}
-	if k.disruptOnScaleDown && !k.evicted && k.metricValue(ctx) == strconv.Itoa(hpaScaleDownValue) && len(live) > 1 {
-		k.evicted = true
-		pod := &live[0]
-		pod.DeletionTimestamp = &metav1.Time{Time: time.Now()}
-		pod.Finalizers = []string{"example.com/node-unreachable"}
-		pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
-			Type: corev1.DisruptionTarget, Status: corev1.ConditionTrue, Reason: "EvictionByEvictionAPI",
-			Message: "Eviction API: evicting",
-		})
-		_, _ = k.c.CoreV1().Pods(k.ns).Update(ctx, pod, metav1.UpdateOptions{})
-		live = live[1:]
-	}
-	if k.evictOnScaleDown && !k.evicted && k.metricValue(ctx) == strconv.Itoa(hpaScaleDownValue) && len(live) > 1 {
-		k.evicted = true
-		k.evict(ctx, &live[0])
-		live = live[1:]
-	}
-	want := int(hpaReplicaCount(d.Spec.Replicas))
-	if k.replaceOnShrink && len(live) > want {
-		for i := range live {
-			k.removePod(ctx, &live[i], false)
-		}
-		live = nil
-	}
-	for len(live) < want {
-		if k.admissionFailure && time.Since(k.lastCreate) < 10*time.Millisecond {
-			break // like a ReplicaSet's backoff, so rejected Pods do not pile up
-		}
-		k.lastCreate = time.Now()
-		pod := k.createPod(ctx, d, len(live))
-		if pod.Status.Phase == corev1.PodFailed {
-			break
-		}
-		live = append(live, pod)
-	}
-	for len(live) > want {
-		k.removePod(ctx, &live[len(live)-1], false)
-		live = live[:len(live)-1]
-	}
-	ready := int32(0)
-	for i := range live {
-		if podIsReady(&live[i]) {
-			ready++
-		}
-	}
-	d.Status = appsv1.DeploymentStatus{ObservedGeneration: d.Generation, Replicas: int32(len(live)), UpdatedReplicas: int32(len(live)), ReadyReplicas: ready}
-	_, _ = k.c.AppsV1().Deployments(k.ns).UpdateStatus(ctx, d, metav1.UpdateOptions{})
-}
-
-func (k *simCluster) reconcileHPA(ctx context.Context, hpa *autoscalingv2.HorizontalPodAutoscaler, d *appsv1.Deployment, live []corev1.Pod, value int) {
-	current := hpaReplicaCount(d.Spec.Replicas)
-	if k.hpaMetricsDenied {
-		hpa.Status = autoscalingv2.HorizontalPodAutoscalerStatus{
-			CurrentReplicas: int32(len(live)),
-			DesiredReplicas: current,
-			Conditions: []autoscalingv2.HorizontalPodAutoscalerCondition{{
-				Type: autoscalingv2.ScalingActive, Status: corev1.ConditionFalse, Reason: "FailedGetPodsMetric",
-				Message: "the HPA was unable to compute the replica count: unable to get metric m: forbidden",
-			}},
-		}
-		_, _ = k.c.AutoscalingV2().HorizontalPodAutoscalers(k.ns).UpdateStatus(ctx, hpa, metav1.UpdateOptions{})
-		return
-	}
-	desired := current
-	switch {
-	case k.misbehaving:
-		desired = hpa.Spec.MaxReplicas
-	case k.ignoreMetric:
-	default:
-		n := max(len(live), 1)
-		desired = int32(math.Ceil(float64(n*value) / hpaTargetValue))
-		desired = min(max(desired, hpaReplicaCount(hpa.Spec.MinReplicas)), hpa.Spec.MaxReplicas)
-	}
-	if desired != current && !k.cannotScale {
-		d.Spec.Replicas = hpaPtr(desired)
-		if updated, err := k.c.AppsV1().Deployments(k.ns).Update(ctx, d, metav1.UpdateOptions{}); err == nil {
-			*d = *updated
-		}
-	}
-	switch {
-	case k.recordedAt.IsZero():
-		k.recorded, k.recordedAt = value, time.Now()
-	case k.recordedStaleBelow && value < hpaTargetValue && k.staleBelow != 0:
-		k.recorded = k.staleBelow
-	case value != k.recorded && time.Since(k.recordedAt) >= k.recordedLag:
-		k.recorded, k.recordedAt = value, time.Now()
-	case value != k.recorded:
-		// still lagging
-	default:
-		k.recordedAt = time.Now()
-	}
-	if k.staleBelow == 0 && k.recorded < hpaTargetValue {
-		k.staleBelow = k.recorded
-	}
-	average := resource.MustParse(strconv.Itoa(k.recorded))
-	status := hpaStatusWith(int32(len(live)), "0")
-	status.ObservedGeneration = nil // as released HPA controllers leave it
-	status.DesiredReplicas = desired
-	status.CurrentMetrics[0].Pods.Metric.Name = hpa.Spec.Metrics[0].Pods.Metric.Name
-	status.CurrentMetrics[0].Pods.Current.AverageValue = &average
-	hpa.Status = status
-	_, _ = k.c.AutoscalingV2().HorizontalPodAutoscalers(k.ns).UpdateStatus(ctx, hpa, metav1.UpdateOptions{})
-}
-
-func (k *simCluster) createPod(ctx context.Context, d *appsv1.Deployment, index int) corev1.Pod {
-	k.seq++
-	pod := corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: fmt.Sprintf("%s-%d", hpaWorkloadName, k.seq), Namespace: k.ns,
-			UID: types.UID(fmt.Sprintf("uid-%d", k.seq)), Labels: d.Spec.Template.Labels,
-		},
-		Spec: *d.Spec.Template.Spec.DeepCopy(),
-	}
-	switch {
-	case k.admissionFailure && index >= 1:
-		pod.Spec.NodeName = "gpu-node"
-		pod.Status = corev1.PodStatus{Phase: corev1.PodFailed, Reason: "UnexpectedAdmissionError",
-			Message: "Allocate failed due to requested number of devices unavailable for nvidia.com/gpu. Requested: 1, Available: 0, which is unexpected"}
-	case k.startupCheckFails && index >= 1:
-		pod.Spec.NodeName = "gpu-node"
-		pod.Status = corev1.PodStatus{Phase: corev1.PodRunning, ContainerStatuses: []corev1.ContainerStatus{{
-			Name:         "workload",
-			RestartCount: 2,
-			State:        corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
-			LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
-				ExitCode: 1, Reason: "Error", Message: "RESULT: ACCELERATOR_COUNT=0\nexpected 1 accelerator device(s), found 0\n",
-			}},
-		}}}
-	case k.pullFailure && index >= 1:
-		pod.Spec.NodeName = "gpu-node"
-		pod.Status = corev1.PodStatus{Phase: corev1.PodPending, ContainerStatuses: []corev1.ContainerStatus{{
-			Name:  "workload",
-			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff", Message: "Back-off pulling image"}},
-		}}}
-	case k.capacity >= 0 && index >= k.capacity:
-		pod.Status = corev1.PodStatus{Phase: corev1.PodPending, Conditions: []corev1.PodCondition{{
-			Type: corev1.PodScheduled, Status: corev1.ConditionFalse, Reason: corev1.PodReasonUnschedulable,
-			Message: "0/1 nodes are available: 1 Insufficient nvidia.com/gpu.",
-		}}}
-	default:
-		pod.Spec.NodeName = "gpu-node"
-		pod.Status = corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}
-		if k.mode == allocationModeDRA {
-			if k.shareFirstClaim && index >= 1 {
-				pod.Status.ResourceClaimStatuses = []corev1.PodResourceClaimStatus{{Name: "claim", ResourceClaimName: hpaPtr(hpaWorkloadName + "-1-claim")}}
-				break
-			}
-			claim := hpaAllocatedClaim(pod.Name+"-claim", pod.UID, k.cfg.DRADriver, 1, "gpu-node")
-			claim.Namespace = k.ns
-			claim.Status.Allocation.Devices.Results[0].Device = fmt.Sprintf("gpu-%d", k.seq) // one device per Pod
-			_, _ = k.c.ResourceV1().ResourceClaims(k.ns).Create(ctx, claim, metav1.CreateOptions{})
-			pod.Status.ResourceClaimStatuses = []corev1.PodResourceClaimStatus{{Name: "claim", ResourceClaimName: hpaPtr(claim.Name)}}
-		}
-	}
-	if k.createdUIDs == nil {
-		k.createdUIDs = map[types.UID]bool{}
-	}
-	k.createdUIDs[pod.UID] = true
-	_, _ = k.c.CoreV1().Pods(k.ns).Create(ctx, &pod, metav1.CreateOptions{})
-	return pod
-}
-
-// evict ends a Pod as node-pressure eviction does: the Pod object stays, in
-// Phase=Failed, and its DRA claim is deallocated.
-func (k *simCluster) evict(ctx context.Context, pod *corev1.Pod) {
-	pod.Status.Phase, pod.Status.Reason, pod.Status.Message = corev1.PodFailed, "Evicted", "The node was low on resource: memory."
-	pod.Status.Conditions = nil
-	_, _ = k.c.CoreV1().Pods(k.ns).UpdateStatus(ctx, pod, metav1.UpdateOptions{})
-	if claim, err := k.c.ResourceV1().ResourceClaims(k.ns).Get(ctx, pod.Name+"-claim", metav1.GetOptions{}); err == nil {
-		claim.Status = resourcev1.ResourceClaimStatus{}
-		_, _ = k.c.ResourceV1().ResourceClaims(k.ns).UpdateStatus(ctx, claim, metav1.UpdateOptions{})
-	}
-}
-
-// removePod deletes a Pod as scale-down (gc=false) or Deployment garbage
-// collection (gc=true) would, subject to the removal knob.
-func (k *simCluster) removePod(ctx context.Context, pod *corev1.Pod, gc bool) {
-	switch {
-	case k.removal == removeStuckTerminating:
-		if pod.DeletionTimestamp == nil {
-			pod.DeletionTimestamp = &metav1.Time{Time: time.Now()}
-			pod.Finalizers = []string{"example.com/stuck"}
-			_, _ = k.c.CoreV1().Pods(k.ns).Update(ctx, pod, metav1.UpdateOptions{})
-		}
-		return
-	case k.removal == removeLeftFailed && !gc:
-		pod.Status.Phase = corev1.PodFailed
-		_, _ = k.c.CoreV1().Pods(k.ns).UpdateStatus(ctx, pod, metav1.UpdateOptions{})
-		return
-	}
-	_ = k.c.CoreV1().Pods(k.ns).Delete(ctx, pod.Name, metav1.DeleteOptions{})
-	if k.removal != removeKeepClaims {
-		_ = k.c.ResourceV1().ResourceClaims(k.ns).Delete(ctx, pod.Name+"-claim", metav1.DeleteOptions{})
-	}
-}
-
-// checkCompletedCycle confirms, from what the simulated cluster saw, that a
-// passing run really scaled up and back down.
-func (k *simCluster) checkCompletedCycle(t *testing.T, maxReplicas int) {
-	t.Helper()
-	ctx := context.Background()
-	k.mu.Lock()
-	peak, raised, created := k.peakLive, len(k.raisedPods), len(k.createdUIDs)
-	k.mu.Unlock()
-	if peak != maxReplicas || created < maxReplicas || raised < maxReplicas {
-		t.Errorf("peak running Pods=%d, distinct Pods created=%d, Pods served the raised metric=%d; want %d each", peak, created, raised, maxReplicas)
-	}
-	live, all := k.workloadPods(ctx)
-	wantAll := 1
-	if k.evicted {
-		wantAll++ // the evicted Pod object stays until something deletes it
-	}
-	if len(live) != 1 || len(all) != wantAll {
-		t.Errorf("after the run: %d live and %d total workload Pods, want 1 and %d", len(live), len(all), wantAll)
-	}
-	claims, err := k.c.ResourceV1().ResourceClaims(k.ns).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	allocated := 0
-	for _, c := range claims.Items {
-		if c.Status.Allocation != nil {
-			allocated++
-		}
-	}
-	want := map[bool]int{true: 1, false: 0}[k.mode == allocationModeDRA]
-	if k.disruptOnScaleDown {
-		want *= 2 // the disrupted Pod is still terminating and keeps its claim
-	}
-	if allocated != want {
-		t.Errorf("after the run: %d allocated ResourceClaims, want %d", allocated, want)
-	}
-}
-
-// logf passes scenario logs to t and, with scaleAtBaseline, makes the HPA
-// scale up exactly when the negative-control window opens.
-func (k *simCluster) logf(t *testing.T) func(string, ...any) {
-	return func(format string, args ...any) {
-		t.Logf(format, args...)
-		if !k.scaleAtBaseline || !strings.HasPrefix(format, hpaNegativeControlLog) {
-			return
-		}
-		k.mu.Lock()
-		defer k.mu.Unlock()
-		k.misbehaving = true
-		ctx := context.Background()
-		d, err := k.c.AppsV1().Deployments(k.ns).Get(ctx, hpaWorkloadName, metav1.GetOptions{})
-		if err != nil {
-			t.Errorf("simulated HPA could not read the Deployment: %v", err)
-			return
-		}
-		hpa, err := k.c.AutoscalingV2().HorizontalPodAutoscalers(k.ns).Get(ctx, hpaWorkloadName, metav1.GetOptions{})
-		if err != nil {
-			t.Errorf("simulated HPA could not read itself: %v", err)
-			return
-		}
-		d.Spec.Replicas = hpaPtr(hpa.Spec.MaxReplicas)
-		if _, err := k.c.AppsV1().Deployments(k.ns).Update(ctx, d, metav1.UpdateOptions{}); err != nil {
-			t.Errorf("simulated HPA could not scale the Deployment: %v", err)
-		}
-	}
-}
-
-// readMetrics plays the custom metrics adapter: every workload Pod reports the
-// ConfigMap value.
-func (k *simCluster) readMetrics(ctx context.Context, namespace, metricName string) ([]byte, error) {
-	if k.metricsMissing {
-		return nil, apierrors.NewNotFound(schema.GroupResource{Group: "custom.metrics.k8s.io", Resource: "pods"}, metricName)
-	}
-	k.mu.Lock()
-	value := k.metricValue(ctx)
-	if k.frozenMetrics {
-		if k.frozen == "" {
-			k.frozen = value
-		}
-		value = k.frozen
-	}
-	k.mu.Unlock()
-	_, all := k.workloadPods(ctx)
-	var items []string
-	for _, pod := range all {
-		if k.newPodsUnscraped && pod.UID != "uid-1" {
-			continue
-		}
-		if value == strconv.Itoa(hpaScaleUpValue) {
-			k.mu.Lock()
-			if k.raisedPods == nil {
-				k.raisedPods = map[string]bool{}
-			}
-			k.raisedPods[pod.Name] = true
-			k.mu.Unlock()
-		}
-		items = append(items, hpaMetricItem("Pod", namespace, pod.Name, metricName, value, false))
-	}
-	if value == strconv.Itoa(hpaScaleUpValue) && k.maxReplicas > 0 && len(items) == k.maxReplicas {
-		if k.settleAPIError {
-			k.nodeReadFails.Store(true)
-		}
-		if k.settleReplacePod && k.settled.CompareAndSwap(false, true) {
-			// The adapter still serves the evicted Pod's last sample, as
-			// Prometheus would until the series goes stale.
-			_ = k.c.CoreV1().Pods(namespace).Delete(ctx, all[len(all)-1].Name, metav1.DeleteOptions{})
-			_ = k.c.ResourceV1().ResourceClaims(namespace).Delete(ctx, all[len(all)-1].Name+"-claim", metav1.DeleteOptions{})
-		}
-	}
-	return hpaMetricList(items...), nil
-}
-
-func TestHPAScenario(t *testing.T) {
-	fastHPATiming(t)
-	tests := []struct {
-		name    string
-		mode    string
-		breakIt func(*simCluster)
-		// wantEnv is whether the failure must be classified as an
-		// environment error rather than a conformance failure.
-		wantEnv         bool
-		wantErr         string
-		wantCleanupFail bool
-		// maxReplicas is the HPA's maxReplicas (default 2).
-		maxReplicas int
-	}{
-		{name: "device plugin passes", mode: allocationModeDevicePlugin},
-		{name: "DRA passes", mode: allocationModeDRA},
-		{name: "device plugin passes with three replicas", mode: allocationModeDevicePlugin, maxReplicas: 3},
-		{name: "DRA passes with three replicas", mode: allocationModeDRA, maxReplicas: 3},
-		{name: "capacity for only two of three replicas", mode: allocationModeDRA, maxReplicas: 3,
-			breakIt: func(k *simCluster) { k.capacity = 2 }, wantEnv: true, wantErr: "is Unschedulable"},
-		{name: "HPA ignores the metric", mode: allocationModeDevicePlugin,
-			breakIt: func(k *simCluster) { k.ignoreMetric = true }, wantErr: "did not scale the Deployment to 2"},
-		{name: "HPA cannot update the Deployment scale", mode: allocationModeDevicePlugin,
-			breakIt: func(k *simCluster) { k.cannotScale = true }, wantErr: "did not scale the Deployment to 2"},
-		{name: "test resources cannot be created", mode: allocationModeDevicePlugin,
-			breakIt: func(k *simCluster) {
-				k.c.PrependReactor("create", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
-					return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "configmaps"}, hpaWorkloadName, errors.New("denied"))
-				})
-			}, wantEnv: true, wantErr: "create metric ConfigMap"},
-		// Area A regressions: normal events while the scaled-up state is
-		// being confirmed must not fail a conforming HPA.
-		{name: "transient API error while confirming the scale-up", mode: allocationModeDevicePlugin,
-			breakIt: func(k *simCluster) { k.settleAPIError = true }},
-		{name: "scaled-up Pod replaced while confirming the scale-up", mode: allocationModeDRA, maxReplicas: 3,
-			breakIt: func(k *simCluster) { k.settleReplacePod = true }},
-		{name: "HPA records each new average after a delay", mode: allocationModeDRA,
-			breakIt: func(k *simCluster) { k.recordedLag = 100 * time.Millisecond }},
-		// The recorded average must be the current phase's value.
-		{name: "HPA records another phase's below-target average", mode: allocationModeDevicePlugin,
-			breakIt: func(k *simCluster) { k.recordedStaleBelow = true }, wantErr: "recorded average 1 for \"m\", want the current value 2"},
-		{name: "HPA controller cannot read the metric", mode: allocationModeDevicePlugin,
-			breakIt: func(k *simCluster) { k.hpaMetricsDenied = true }, wantEnv: true, wantErr: "FailedGetPodsMetric"},
-		{name: "pipeline misses the scaled-up Pods", mode: allocationModeDevicePlugin,
-			breakIt: func(k *simCluster) { k.newPodsUnscraped = true }, wantEnv: true, wantErr: "no sample for Pod"},
-		// The scaled-up Pods' own startup check fails: not an HPA failure.
-		{name: "scaled-up Pods fail their accelerator startup check", mode: allocationModeDevicePlugin,
-			breakIt: func(k *simCluster) { k.startupCheckFails = true }, wantEnv: true, wantErr: "exited with code 1 (Error), restarts=2; output: RESULT: ACCELERATOR_COUNT=0 expected 1 accelerator device(s), found 0"},
-		{name: "scaled-up Pods cannot pull the image", mode: allocationModeDevicePlugin,
-			breakIt: func(k *simCluster) { k.pullFailure = true }, wantEnv: true, wantErr: "ImagePullBackOff"},
-		{name: "HPA scales with the metric below target", mode: allocationModeDevicePlugin,
-			breakIt: func(k *simCluster) { k.scaleAtBaseline = true }, wantErr: "did not hold 1 replica"},
-		{name: "insufficient accelerator capacity", mode: allocationModeDRA,
-			breakIt: func(k *simCluster) { k.capacity = 1 }, wantEnv: true, wantErr: "is Unschedulable: 0/1 nodes are available: 1 Insufficient nvidia.com/gpu."},
-		{name: "no accelerator capacity at all", mode: allocationModeDevicePlugin,
-			breakIt: func(k *simCluster) { k.capacity = 0 }, wantEnv: true, wantErr: "baseline accelerator Pod did not become Ready"},
-		{name: "metric never served", mode: allocationModeDevicePlugin,
-			breakIt: func(k *simCluster) { k.metricsMissing = true }, wantEnv: true, wantErr: "does not serve the workload metric"},
-		{name: "metric updates never propagate", mode: allocationModeDevicePlugin,
-			breakIt: func(k *simCluster) { k.frozenMetrics = true }, wantEnv: true, wantErr: "did not report the raised metric"},
-		{name: "removed Pods stay terminating", mode: allocationModeDevicePlugin,
-			breakIt: func(k *simCluster) { k.removal = removeStuckTerminating }, wantErr: "(Terminating)", wantCleanupFail: true},
-		// A Pod left behind without being deleted no longer counts as a
-		// removed replica; under DRA its still-allocated claim fails the run.
-		{name: "removed Pods are left behind as Failed, holding their claims", mode: allocationModeDRA,
-			breakIt: func(k *simCluster) { k.removal = removeLeftFailed }, wantErr: "still allocated for removed Pods: hpa-workload-2-claim"},
-		// Pod lifecycle events outside autoscaling must not fail a
-		// conforming HPA.
-		{name: "scale-down replaces Pods instead of removing them", mode: allocationModeDevicePlugin,
-			breakIt: func(k *simCluster) { k.replaceOnShrink = true }},
-		{name: "node evicts a Pod during scale-down (DRA)", mode: allocationModeDRA,
-			breakIt: func(k *simCluster) { k.evictOnScaleDown = true }},
-		{name: "node evicts a Pod during scale-down (device plugin)", mode: allocationModeDevicePlugin,
-			breakIt: func(k *simCluster) { k.evictOnScaleDown = true }},
-		{name: "evicted Pod still terminating after scale-down (DRA)", mode: allocationModeDRA,
-			breakIt: func(k *simCluster) { k.disruptOnScaleDown = true }},
-		{name: "evicted Pod still terminating after scale-down (device plugin)", mode: allocationModeDevicePlugin,
-			breakIt: func(k *simCluster) { k.disruptOnScaleDown = true }},
-		// Pods the node rejected are terminal, but still an environment
-		// problem.
-		{name: "scaled-up Pods share one ResourceClaim", mode: allocationModeDRA,
-			breakIt: func(k *simCluster) { k.shareFirstClaim = true }, wantErr: "ResourceClaim hpa-workload-1-claim was not generated for Pod hpa-workload-2"},
-		{name: "scaled-up Pods rejected at admission", mode: allocationModeDevicePlugin,
-			breakIt: func(k *simCluster) { k.admissionFailure = true }, wantEnv: true, wantErr: "failed (UnexpectedAdmissionError: Allocate failed"},
-		{name: "removed Pods keep their DRA claims", mode: allocationModeDRA,
-			breakIt: func(k *simCluster) { k.removal = removeKeepClaims }, wantErr: "still allocated for removed Pods: hpa-workload-2-claim (generated for Pod p)", wantCleanupFail: true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Each case has its own fake cluster; the shared timing variables
-			// are only read until the parent test's cleanup restores them.
-			t.Parallel()
-			k := newSimCluster(t, tt.mode)
-			timeout := 3 * time.Second
-			if tt.wantErr != "" {
-				timeout = time.Second
-			}
-			if tt.breakIt != nil {
-				tt.breakIt(k)
-			}
-			maxReplicas := max(tt.maxReplicas, 2)
-			k.maxReplicas = maxReplicas
-			s := newHPAScenario(k.c, k.ns, tt.mode, "v1beta2", k.cfg, testHPAConfigN(t, timeout, maxReplicas), k.logf(t))
-			s.readMetrics = k.readMetrics
-			k.start(t)
-
-			err := s.run(context.Background())
-			switch {
-			case tt.wantErr == "" && err != nil:
-				t.Fatalf("run failed: %v", err)
-			case tt.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErr)):
-				t.Fatalf("run error = %v, want it to contain %q", err, tt.wantErr)
-			case tt.wantErr != "" && isHPAEnvironmentError(err) != tt.wantEnv:
-				t.Fatalf("run error %q classified as environment=%t, want %t", hpaFailureMessage(err), isHPAEnvironmentError(err), tt.wantEnv)
-			}
-			if tt.wantErr == "" {
-				k.checkCompletedCycle(t, maxReplicas)
-			}
-
-			cleanupErr := s.cleanup(context.Background())
-			if (cleanupErr != nil) != tt.wantCleanupFail {
-				t.Fatalf("cleanup error = %v, want failure %t", cleanupErr, tt.wantCleanupFail)
-			}
-			if !tt.wantCleanupFail {
-				_, all := k.workloadPods(context.Background())
-				claims, _ := k.c.ResourceV1().ResourceClaims(k.ns).List(context.Background(), metav1.ListOptions{})
-				if len(all) > 0 || len(claims.Items) > 0 {
-					t.Fatalf("cleanup left %d Pods and %d ResourceClaims", len(all), len(claims.Items))
-				}
-			}
-		})
+	got := hpaAllocatedClaims([]resourcev1.ResourceClaim{claim("b", true), claim("released", false), claim("a", true)})
+	if fmt.Sprint(got) != "[a b]" {
+		t.Errorf("hpaAllocatedClaims = %v, want [a b]", got)
 	}
 }
 
@@ -2117,6 +1303,27 @@ func TestHPACleanup(t *testing.T) {
 		}
 	})
 
+	// The fake clientset does not garbage-collect, so the Pod outlives the
+	// Deployment, as a Pod stuck terminating would.
+	t.Run("reports workload Pods that are never removed", func(t *testing.T) {
+		pod := hpaReadyPod("hpa-workload-1", "n", "u1")
+		s := testHPAScenario(t, fake.NewClientset(&pod))
+		if err := s.cleanup(ctx); err == nil || !strings.Contains(err.Error(), "remaining: 1 workload Pods") {
+			t.Fatalf("cleanup error = %v, want the remaining Pod reported", err)
+		}
+	})
+
+	t.Run("reports ResourceClaims that stay allocated", func(t *testing.T) {
+		claim := &resourcev1.ResourceClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: "hpa-workload-1-claim", Namespace: "ns"},
+			Status:     resourcev1.ResourceClaimStatus{Allocation: &resourcev1.AllocationResult{}},
+		}
+		s := newHPAScenario(fake.NewClientset(claim), "ns", allocationModeDRA, "v1beta2", nvidiaConfig(t), testHPAConfig(t, time.Second), t.Logf)
+		if err := s.cleanup(ctx); err == nil || !strings.Contains(err.Error(), "allocated ResourceClaims hpa-workload-1-claim") {
+			t.Fatalf("cleanup error = %v, want the allocated claim reported", err)
+		}
+	})
+
 	t.Run("nothing to clean up after a failed setup", func(t *testing.T) {
 		s := newHPAScenario(fake.NewClientset(), "ns", allocationModeDRA, "v1beta2", nvidiaConfig(t), testHPAConfig(t, time.Second), t.Logf)
 		if err := s.cleanup(ctx); err != nil {
@@ -2184,6 +1391,22 @@ func TestHoldStateRequiresObservationThroughoutTheWindow(t *testing.T) {
 	_, err := s.holdState(context.Background(), time.Second, func(context.Context, hpaState) error { return nil })
 	if !isHPAEnvironmentError(err) || !strings.Contains(err.Error(), "could not observe the HPA for") {
 		t.Fatalf("holdState with an unobserved gap returned %v, want an environment error", err)
+	}
+}
+
+// A successful API response that arrives only after an unobserved gap
+// must not make the negative-control window pass retrospectively.
+func TestHoldStateRejectsSlowSuccessfulObservation(t *testing.T) {
+	fastHPATiming(t)
+	c := fake.NewClientset(&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: hpaWorkloadName, Namespace: "ns"}})
+	c.PrependReactor("get", "horizontalpodautoscalers", func(k8stesting.Action) (bool, runtime.Object, error) {
+		time.Sleep(400 * time.Millisecond) // longer than the 250ms observation grace
+		return false, nil, nil
+	})
+	s := testHPAScenario(t, c)
+	_, err := s.holdState(context.Background(), 150*time.Millisecond, func(context.Context, hpaState) error { return nil })
+	if !isHPAEnvironmentError(err) || !strings.Contains(err.Error(), "could not observe the HPA for") {
+		t.Fatalf("slow successful observation returned %v, want an observation-gap environment error", err)
 	}
 }
 

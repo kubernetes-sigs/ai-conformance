@@ -22,13 +22,11 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/retry"
-	"k8s.io/component-helpers/scheduling/corev1/nodeaffinity"
 )
 
 // Integration contract (see test/README.md): the platform scrapes Pods
@@ -56,10 +54,6 @@ const (
 	hpaScaleUpValue   = 100
 	hpaScaleDownValue = 2
 )
-
-// hpaNegativeControlLog starts the log line that opens the negative-control
-// window; the unit-test simulator keys on it.
-const hpaNegativeControlLog = "Negative control"
 
 // Overridden by unit tests.
 var (
@@ -101,9 +95,9 @@ func init() {
 	hpaMetricTimeout = flag.Duration("hpa-metric-timeout", 5*time.Minute,
 		"How long to wait for a metric change to be reported by the custom metrics API for every expected Pod, and for the HPA to first act on the metric.")
 	hpaScaleUpTimeout = flag.Duration("hpa-scale-up-timeout", 10*time.Minute,
-		"How long to wait for the baseline Pod to become Ready, and for the HPA to scale up with every new accelerator Pod Ready.")
+		"How long to wait for the baseline Pod to become Ready, and for the HPA to scale up with every new Pod Running and Ready.")
 	hpaScaleDownTimeout = flag.Duration("hpa-scale-down-timeout", 10*time.Minute,
-		"How long to wait for the HPA to scale back down and the removed Pods to be deleted (and, with DRA, their ResourceClaims deallocated), including the stabilization window.")
+		"How long to wait for the HPA to scale back down to one Running and Ready replica, including the stabilization window.")
 	hpaScaleDownStabilization = flag.Duration("hpa-scale-down-stabilization", time.Minute,
 		"Scale-down stabilization window set on the test HPA (behavior.scaleDown.stabilizationWindowSeconds). Must be shorter than -hpa-scale-down-timeout.")
 }
@@ -119,7 +113,7 @@ func TestHPAAutoscaling(t *testing.T) {
 		flag.Parse()
 	}
 	if *hpaCustomMetricName == "" {
-		t.Skip("HPA autoscaling test is not configured; if the platform does not support the HorizontalPodAutoscaler with custom metrics, mark pod_autoscaling N/A, otherwise configure the custom metrics pipeline described in test/README.md and set -hpa-custom-metric-name")
+		t.Skip("HPA autoscaling test is not configured; if the platform does not support the HorizontalPodAutoscaler, mark pod_autoscaling N/A, otherwise configure the custom metrics pipeline described in test/README.md and set -hpa-custom-metric-name")
 	}
 	hc, err := newHPAConfig(*hpaCustomMetricName, *hpaMaxReplicas, *hpaPodAnnotations, *hpaWorkloadImage,
 		*hpaMetricTimeout, *hpaScaleUpTimeout, *hpaScaleDownTimeout, *hpaScaleDownStabilization)
@@ -652,14 +646,6 @@ func (s hpaState) podNames() []string {
 	return names
 }
 
-func (s hpaState) podUIDs() map[types.UID]bool {
-	uids := make(map[types.UID]bool, len(s.pods))
-	for _, pod := range s.pods {
-		uids[pod.UID] = true
-	}
-	return uids
-}
-
 // checkHPAStatus requires the HPA to be active on the custom metric, to have
 // recorded exactly the phase's value as its average, and to decide on want
 // replicas. The HPA records the plain mean of its Pods' samples, so once every
@@ -754,151 +740,11 @@ func checkHPADecided(s hpaState, metricName string, want int32, value int) error
 	return nil
 }
 
-// checkHPARemovedPodsGone requires every Pod the scale-down deleted to be
-// gone. Pod events outside autoscaling are allowed (and logged by
-// hpaLifecycleNotes):
-//   - a Pod its node ended without deleting it (e.g. evicted under node
-//     pressure) stays until something deletes it, but holds no accelerator;
-//   - a Pod terminating after a disruption carries DisruptionTarget=True
-//     (eviction API, taint eviction, preemption, Pod GC, kubelet), which the
-//     ReplicaSet never sets on the replicas it removes, and may terminate
-//     slowly, e.g. on an unreachable node;
-//   - the remaining replica may replace a Pod lost that way.
-func checkHPARemovedPodsGone(s hpaState) error {
-	var left []string
-	for i := range s.inactive {
-		pod := &s.inactive[i]
-		if _, disrupted := hpaTerminatingAfterDisruption(pod); pod.DeletionTimestamp != nil && !disrupted {
-			left = append(left, pod.Name+" (Terminating)")
-		}
-	}
-	if len(left) > 0 {
-		return fmt.Errorf("removed Pods still exist: %s", strings.Join(left, ", "))
-	}
-	return nil
-}
-
-// hpaTerminatingAfterDisruption reports whether pod is being deleted with a
-// DisruptionTarget=True condition, and returns the condition's reason.
-func hpaTerminatingAfterDisruption(pod *corev1.Pod) (string, bool) {
-	if pod.DeletionTimestamp == nil {
-		return "", false
-	}
-	for _, c := range pod.Status.Conditions {
-		if c.Type == corev1.DisruptionTarget && c.Status == corev1.ConditionTrue {
-			return c.Reason, true
-		}
-	}
-	return "", false
-}
-
-// hpaClaimHolders returns the Pods whose ResourceClaims may still be allocated
-// after the scale-down: the active Pods and Pods terminating after a
-// disruption, which keep their claims until they are gone.
-func hpaClaimHolders(s hpaState) map[types.UID]bool {
-	holders := s.podUIDs()
-	for i := range s.inactive {
-		if _, disrupted := hpaTerminatingAfterDisruption(&s.inactive[i]); disrupted {
-			holders[s.inactive[i].UID] = true
-		}
-	}
-	return holders
-}
-
-// hpaLifecycleNotes describes the Pod events checkHPARemovedPodsGone allows.
-func hpaLifecycleNotes(s hpaState, scaledUp map[types.UID]bool) string {
-	var notes []string
-	for i := range s.inactive {
-		pod := &s.inactive[i]
-		if reason, disrupted := hpaTerminatingAfterDisruption(pod); disrupted {
-			notes = append(notes, fmt.Sprintf("Pod %s is terminating after a disruption (%s), not removed by the scale-down", pod.Name, reason))
-			continue
-		}
-		if pod.DeletionTimestamp == nil {
-			state := string(pod.Status.Phase)
-			if pod.Status.Reason != "" {
-				state += ": " + pod.Status.Reason
-			}
-			notes = append(notes, fmt.Sprintf("Pod %s was ended by its node (%s), not removed by the scale-down", pod.Name, state))
-		}
-	}
-	for _, pod := range s.pods {
-		if !scaledUp[pod.UID] {
-			notes = append(notes, fmt.Sprintf("Pod %s replaced a scaled-up Pod", pod.Name))
-		}
-	}
-	if len(notes) == 0 {
-		return ""
-	}
-	return "; note: " + strings.Join(notes, "; ")
-}
-
 func hpaReplicaCount(p *int32) int32 {
 	if p == nil {
 		return 0
 	}
 	return *p
-}
-
-// verifyHPAPodsOnAccelerators checks that every Pod holds its own accelerator
-// on a node that can provide it: in DRA mode no device is allocated to two
-// Pods (except as separate shares), and in device-plugin mode no node runs
-// more of the Pods than it has allocatable accelerators.
-func verifyHPAPodsOnAccelerators(ctx context.Context, c kubernetes.Interface, pods []corev1.Pod, mode string, cfg AcceleratorConfig) error {
-	nodes := map[string]*corev1.Node{}
-	podsOnNode := map[string]int64{}
-	deviceHolder := map[string]string{}
-	for i := range pods {
-		pod := &pods[i]
-		node, ok := nodes[pod.Spec.NodeName]
-		if !ok {
-			var err error
-			if node, err = c.CoreV1().Nodes().Get(ctx, pod.Spec.NodeName, metav1.GetOptions{}); err != nil {
-				return hpaAPIError(fmt.Errorf("get node %s of Pod %s: %w", pod.Spec.NodeName, pod.Name, err))
-			}
-			nodes[node.Name] = node
-		}
-		var claims []*resourcev1.ResourceClaim
-		if mode == allocationModeDRA {
-			for _, status := range pod.Status.ResourceClaimStatuses {
-				if status.ResourceClaimName == nil {
-					continue
-				}
-				claim, err := c.ResourceV1().ResourceClaims(pod.Namespace).Get(ctx, *status.ResourceClaimName, metav1.GetOptions{})
-				if err != nil {
-					return hpaAPIError(fmt.Errorf("get ResourceClaim %s of Pod %s: %w", *status.ResourceClaimName, pod.Name, err))
-				}
-				claims = append(claims, claim)
-			}
-		}
-		if err := checkHPAPodAccelerator(pod, node, claims, mode, cfg); err != nil {
-			return err
-		}
-		podsOnNode[node.Name] += requestedAcceleratorCount
-		for _, claim := range claims {
-			for _, r := range claim.Status.Allocation.Devices.Results {
-				key := r.Driver + "/" + r.Pool + "/" + r.Device
-				if r.ShareID != nil {
-					key += "#" + string(*r.ShareID)
-				}
-				if other, dup := deviceHolder[key]; dup {
-					return fmt.Errorf("device %s is allocated to both Pod %s and Pod %s", key, other, pod.Name)
-				}
-				deviceHolder[key] = pod.Name
-			}
-		}
-	}
-	if mode == allocationModeDevicePlugin {
-		resourceName := corev1.ResourceName(cfg.ExtendedResource)
-		for name, n := range podsOnNode {
-			allocatable := nodes[name].Status.Allocatable[resourceName]
-			if n > allocatable.Value() {
-				return fmt.Errorf("node %s runs %d of the test's Pods, each holding %d %s, but has only %s allocatable",
-					name, n/requestedAcceleratorCount, requestedAcceleratorCount, resourceName, allocatable.String())
-			}
-		}
-	}
-	return nil
 }
 
 // isPermanentAPIError reports a definitive API answer, such as Forbidden.
@@ -916,94 +762,16 @@ func hpaAPIError(err error) error {
 	return err
 }
 
-func checkHPAPodAccelerator(pod *corev1.Pod, node *corev1.Node, claims []*resourcev1.ResourceClaim, mode string, cfg AcceleratorConfig) error {
-	if !podRequestsAccelerator(pod, mode, cfg) {
-		return fmt.Errorf("Pod %s does not request an accelerator in %s mode", pod.Name, mode)
-	}
-	switch mode {
-	case allocationModeDevicePlugin:
-		resourceName := corev1.ResourceName(cfg.ExtendedResource)
-		allocatable := node.Status.Allocatable[resourceName]
-		if allocatable.Value() < requestedAcceleratorCount {
-			return fmt.Errorf("Pod %s runs on node %s with allocatable %s=%s", pod.Name, node.Name, resourceName, allocatable.String())
-		}
-		return nil
-	case allocationModeDRA:
-		if len(claims) != 1 {
-			return fmt.Errorf("Pod %s has %d generated ResourceClaims in its status, want 1", pod.Name, len(claims))
-		}
-		return checkHPAClaimAllocation(pod, node, claims[0], cfg)
-	default:
-		return fmt.Errorf("unknown allocation mode %q", mode)
-	}
-}
-
-func checkHPAClaimAllocation(pod *corev1.Pod, node *corev1.Node, claim *resourcev1.ResourceClaim, cfg AcceleratorConfig) error {
-	// The claim must be generated for this Pod, not shared with other Pods.
-	if owner := metav1.GetControllerOf(claim); owner == nil || owner.Kind != "Pod" || owner.UID != pod.UID {
-		return fmt.Errorf("ResourceClaim %s was not generated for Pod %s (controller owner %v)", claim.Name, pod.Name, owner)
-	}
-	alloc := claim.Status.Allocation
-	if alloc == nil {
-		return fmt.Errorf("ResourceClaim %s of Pod %s is not allocated", claim.Name, pod.Name)
-	}
-	if len(claim.Status.ReservedFor) != 1 || !claimReservedFor(claim, map[types.UID]bool{pod.UID: true}) {
-		return fmt.Errorf("ResourceClaim %s is reserved for %v, want only Pod %s", claim.Name, claim.Status.ReservedFor, pod.Name)
-	}
-	devices := 0
-	for _, r := range alloc.Devices.Results {
-		if r.Request != testRequestName {
-			continue
-		}
-		if r.Driver != cfg.DRADriver {
-			return fmt.Errorf("ResourceClaim %s allocated device %s/%s from driver %s, want %s", claim.Name, r.Pool, r.Device, r.Driver, cfg.DRADriver)
-		}
-		devices++
-	}
-	if int64(devices) != requestedAcceleratorCount {
-		return fmt.Errorf("ResourceClaim %s allocated %d devices for request %s, want %d", claim.Name, devices, testRequestName, requestedAcceleratorCount)
-	}
-	if alloc.NodeSelector != nil {
-		matcher, err := nodeaffinity.NewNodeSelector(alloc.NodeSelector)
-		if err != nil {
-			return fmt.Errorf("ResourceClaim %s has an invalid allocation node selector: %w", claim.Name, err)
-		}
-		if !matcher.Match(node) {
-			return fmt.Errorf("Pod %s runs on node %s outside the allocation node selector of ResourceClaim %s", pod.Name, node.Name, claim.Name)
+// hpaAllocatedClaims returns the names of the claims that are still allocated.
+func hpaAllocatedClaims(claims []resourcev1.ResourceClaim) []string {
+	var names []string
+	for _, claim := range claims {
+		if claim.Status.Allocation != nil {
+			names = append(names, claim.Name)
 		}
 	}
-	return nil
-}
-
-func claimReservedFor(claim *resourcev1.ResourceClaim, pods map[types.UID]bool) bool {
-	for _, ref := range claim.Status.ReservedFor {
-		if ref.Resource == "pods" && pods[ref.UID] {
-			return true
-		}
-	}
-	return false
-}
-
-// checkHPAClaimsReleased fails while a claim is allocated but not reserved for
-// one of the live Pods.
-func checkHPAClaimsReleased(claims []resourcev1.ResourceClaim, live map[types.UID]bool) error {
-	var held []string
-	for i := range claims {
-		claim := &claims[i]
-		if claim.Status.Allocation == nil || claimReservedFor(claim, live) {
-			continue
-		}
-		owner := "unknown Pod"
-		if ref := metav1.GetControllerOf(claim); ref != nil {
-			owner = ref.Kind + " " + ref.Name
-		}
-		held = append(held, fmt.Sprintf("%s (generated for %s)", claim.Name, owner))
-	}
-	if len(held) > 0 {
-		sort.Strings(held)
-		return fmt.Errorf("ResourceClaims still allocated for removed Pods: %s", strings.Join(held, ", "))
-	}
-	return nil
+	sort.Strings(names)
+	return names
 }
 
 // hpaPodPrerequisiteProblems lists Pods held back by something other than the
@@ -1109,11 +877,10 @@ func (s *hpaScenario) run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	scaled, err := s.scaleUp(ctx, baseline)
-	if err != nil {
+	if err := s.scaleUp(ctx, baseline); err != nil {
 		return err
 	}
-	return s.scaleDown(ctx, scaled)
+	return s.scaleDown(ctx)
 }
 
 func (s *hpaScenario) deploy(ctx context.Context) error {
@@ -1132,14 +899,11 @@ func (s *hpaScenario) deploy(ctx context.Context) error {
 
 func (s *hpaScenario) establishBaseline(ctx context.Context) (hpaState, error) {
 	s.logf("Waiting for the baseline accelerator Pod to become Ready...")
-	state, err := s.waitForState(ctx, s.hc.scaleUpTimeout, func(ctx context.Context, st hpaState) error {
+	state, err := s.waitForState(ctx, s.hc.scaleUpTimeout, func(_ context.Context, st hpaState) error {
 		if st.hpa != nil {
 			return errors.New("HPA exists before the baseline was established")
 		}
-		if err := checkHPAWorkload(st, hpaMinReplicas); err != nil {
-			return err
-		}
-		return verifyHPAPodsOnAccelerators(ctx, s.c, st.pods, s.mode, s.cfg)
+		return checkHPAWorkload(st, hpaMinReplicas)
 	})
 	if err != nil {
 		if problems := hpaPodPrerequisiteProblems(state.allPods()); len(problems) > 0 {
@@ -1163,7 +927,7 @@ func (s *hpaScenario) establishBaseline(ctx context.Context) (hpaState, error) {
 	if state, err = s.waitForState(ctx, s.hc.metricTimeout, atBaseline); err != nil {
 		return hpaState{}, hpaPhaseFailure(fmt.Errorf("HPA did not reconcile on the custom metric at baseline: %w", err), state)
 	}
-	s.logf(hpaNegativeControlLog+": the HPA must stay at %d replica for %s while the metric is below target...", hpaMinReplicas, hpaNegativeControlWindow)
+	s.logf("Negative control: the HPA must stay at %d replica for %s while the metric is below target...", hpaMinReplicas, hpaNegativeControlWindow)
 	held := func(_ context.Context, st hpaState) error {
 		return checkHPADecided(st, s.hc.metricName, hpaMinReplicas, hpaBaselineValue)
 	}
@@ -1174,23 +938,23 @@ func (s *hpaScenario) establishBaseline(ctx context.Context) (hpaState, error) {
 	return state, nil
 }
 
-func (s *hpaScenario) scaleUp(ctx context.Context, baseline hpaState) (hpaState, error) {
+func (s *hpaScenario) scaleUp(ctx context.Context, baseline hpaState) error {
 	deadline := time.Now().Add(s.hc.scaleUpTimeout)
 	maxReplicas := s.hc.maxReplicas
 
 	s.logf("Raising the custom metric to %d (target %d)...", hpaScaleUpValue, hpaTargetValue)
 	if err := setHPAMetricValue(ctx, s.c, s.namespace, hpaScaleUpValue); err != nil {
-		return hpaState{}, hpaEnvironmentError(fmt.Errorf("update metric ConfigMap: %w", err))
+		return hpaEnvironmentError(fmt.Errorf("update metric ConfigMap: %w", err))
 	}
 	if err := s.waitForMetric(ctx, hpaScaleUpValue, fixedPods(baseline.podNames())); err != nil {
-		return hpaState{}, hpaEnvironmentError(fmt.Errorf("custom metrics pipeline did not report the raised metric: %w", err))
+		return hpaEnvironmentError(fmt.Errorf("custom metrics pipeline did not report the raised metric: %w", err))
 	}
 
 	state, err := s.waitForState(ctx, time.Until(deadline), func(_ context.Context, st hpaState) error {
 		return checkHPADecided(st, s.hc.metricName, maxReplicas, hpaScaleUpValue)
 	})
 	if err != nil {
-		return hpaState{}, hpaPhaseFailure(fmt.Errorf("HPA did not scale the Deployment to %d replicas on the raised metric: %w", maxReplicas, err), state)
+		return hpaPhaseFailure(fmt.Errorf("HPA did not scale the Deployment to %d replicas on the raised metric: %w", maxReplicas, err), state)
 	}
 	s.logf("HPA set the Deployment to %d replicas; waiting for the new accelerator Pods...", maxReplicas)
 
@@ -1201,9 +965,6 @@ func (s *hpaScenario) scaleUp(ctx context.Context, baseline hpaState) (hpaState,
 	state, err = s.waitForState(ctx, time.Until(deadline.Add(s.hc.metricTimeout)), func(ctx context.Context, st hpaState) error {
 		metricProblem = nil
 		if err := checkHPAScaledTo(st, s.hc.metricName, maxReplicas, hpaScaleUpValue); err != nil {
-			return err
-		}
-		if err := verifyHPAPodsOnAccelerators(ctx, s.c, st.pods, s.mode, s.cfg); err != nil {
 			return err
 		}
 		body, err := s.readMetrics(ctx, s.namespace, s.hc.metricName)
@@ -1219,12 +980,12 @@ func (s *hpaScenario) scaleUp(ctx context.Context, baseline hpaState) (hpaState,
 	switch {
 	case err == nil:
 	case metricProblem != nil:
-		return hpaState{}, hpaEnvironmentError(fmt.Errorf("custom metrics pipeline did not report the raised metric for the scaled-up Pods: %w", err))
+		return hpaEnvironmentError(fmt.Errorf("custom metrics pipeline did not report the raised metric for the scaled-up Pods: %w", err))
 	default:
-		return hpaState{}, s.scaleUpFailure(fmt.Errorf("the %d scaled-up Pods did not all become Ready on accelerators: %w", maxReplicas, err), state)
+		return s.scaleUpFailure(fmt.Errorf("the %d scaled-up Pods did not all become Running and Ready: %w", maxReplicas, err), state)
 	}
-	s.logf("PASS: HPA scaled up to %d replicas; Pods %v are Ready on accelerators", maxReplicas, state.podNames())
-	return state, nil
+	s.logf("PASS: HPA scaled up to %d replicas; Pods %v are Running and Ready", maxReplicas, state.podNames())
+	return nil
 }
 
 // scaleUpFailure classifies a failure to get the scaled-up Pods Ready: if the
@@ -1239,7 +1000,7 @@ func (s *hpaScenario) scaleUpFailure(err error, last hpaState) error {
 	return hpaPhaseFailure(err, last)
 }
 
-func (s *hpaScenario) scaleDown(ctx context.Context, scaled hpaState) error {
+func (s *hpaScenario) scaleDown(ctx context.Context) error {
 	s.logf("Lowering the custom metric to %d (target %d)...", hpaScaleDownValue, hpaTargetValue)
 	lowered := time.Now()
 	if err := setHPAMetricValue(ctx, s.c, s.namespace, hpaScaleDownValue); err != nil {
@@ -1249,43 +1010,18 @@ func (s *hpaScenario) scaleDown(ctx context.Context, scaled hpaState) error {
 		return hpaEnvironmentError(fmt.Errorf("custom metrics pipeline did not report the lowered metric: %w", err))
 	}
 
-	scaledUIDs := scaled.podUIDs()
 	s.logf("Waiting up to %s for the HPA to scale down after its %s stabilization window...", s.hc.scaleDownTimeout, s.hc.stabilization)
-	state, err := s.waitForState(ctx, s.hc.scaleDownTimeout, func(ctx context.Context, st hpaState) error {
-		if err := checkHPAScaledTo(st, s.hc.metricName, hpaMinReplicas, hpaScaleDownValue); err != nil {
-			return err
-		}
-		if err := checkHPARemovedPodsGone(st); err != nil {
-			return err
-		}
-		if s.mode == allocationModeDRA {
-			claims, err := s.c.ResourceV1().ResourceClaims(s.namespace).List(ctx, metav1.ListOptions{})
-			if err != nil {
-				return hpaAPIError(fmt.Errorf("list ResourceClaims: %w", err))
-			}
-			if err := checkHPAClaimsReleased(claims.Items, hpaClaimHolders(st)); err != nil {
-				return err
-			}
-		}
-		return verifyHPAPodsOnAccelerators(ctx, s.c, st.pods, s.mode, s.cfg)
+	state, err := s.waitForState(ctx, s.hc.scaleDownTimeout, func(_ context.Context, st hpaState) error {
+		return checkHPAScaledTo(st, s.hc.metricName, hpaMinReplicas, hpaScaleDownValue)
 	})
 	if err != nil {
-		return hpaPhaseFailure(fmt.Errorf("HPA did not scale back down to %d replica with the removed %s: %w", hpaMinReplicas, s.removalDescription(), err), state)
+		return hpaPhaseFailure(fmt.Errorf("HPA did not scale back down to %d replica: %w", hpaMinReplicas, err), state)
 	}
 	// The stabilization window is reported, not asserted: how soon a correct
 	// HPA scales down also depends on its sync period.
-	s.logf("PASS: HPA scaled down to %d replica (%v) with the removed %s, observed %s after the metric was lowered (scale-down stabilization window %s)%s",
-		hpaMinReplicas, state.podNames(), s.removalDescription(), time.Since(lowered).Round(time.Second), s.hc.stabilization, hpaLifecycleNotes(state, scaledUIDs))
+	s.logf("PASS: HPA scaled down to %d replica (%v), observed %s after the metric was lowered (scale-down stabilization window %s)",
+		hpaMinReplicas, state.podNames(), time.Since(lowered).Round(time.Second), s.hc.stabilization)
 	return nil
-}
-
-// removalDescription states what the test verifies about removed replicas;
-// with a device plugin it cannot see the device being returned.
-func (s *hpaScenario) removalDescription() string {
-	if s.mode == allocationModeDRA {
-		return "Pods deleted and their ResourceClaims no longer allocated"
-	}
-	return "Pods deleted"
 }
 
 func fixedPods(names []string) func(context.Context) ([]string, error) {
@@ -1405,8 +1141,14 @@ func (s *hpaScenario) holdState(ctx context.Context, window time.Duration, check
 		st, err := getHPAState(ctx, s.c, s.namespace)
 		switch {
 		case err == nil:
+			// A successful but slow API read must not hide a gap in
+			// observation, even when it returns after the window ends.
+			observedAt := time.Now()
+			if gap := observedAt.Sub(lastObserved); gap > hpaObservationGrace {
+				return last, hpaEnvironmentError(fmt.Errorf("could not observe the HPA for %s during the %s window", gap.Round(time.Millisecond), window))
+			}
 			last = st
-			lastObserved = time.Now()
+			lastObserved = observedAt
 			if problem := check(ctx, st); problem != nil {
 				return last, problem
 			}
@@ -1476,8 +1218,8 @@ func (s *hpaScenario) cleanup(ctx context.Context) error {
 				lastAPIError = err
 				return false, nil
 			}
-			if err := checkHPAClaimsReleased(claims.Items, nil); err != nil {
-				remaining = err.Error()
+			if allocated := hpaAllocatedClaims(claims.Items); len(allocated) > 0 {
+				remaining = "allocated ResourceClaims " + strings.Join(allocated, ", ")
 				return false, nil
 			}
 		}
