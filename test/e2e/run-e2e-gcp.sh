@@ -276,8 +276,8 @@ nodes:
     nodeRegistration:
       kubeletExtraArgs:
         feature-gates: "DynamicResourceAllocation=true"
-  {{- range \$gpu := until numGPUs }}
   extraMounts:
+  {{- range \$gpu := until numGPUs }}
   - hostPath: /dev/null
     containerPath: /var/run/nvidia-container-devices/{{ \$gpu }}
   {{- end }}
