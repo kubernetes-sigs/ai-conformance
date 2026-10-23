@@ -26,7 +26,7 @@ mkdir -p "${ARTIFACTS}"
 DEFAULT_GCE_ZONES="us-central1-b us-central1-c us-central1-a us-east1-c us-west1-b"
 GCE_ZONES="${GCE_ZONE:-$DEFAULT_GCE_ZONES}"
 GCE_MACHINE_TYPE="${GCE_MACHINE_TYPE:-n1-standard-4}"
-GCE_ACCELERATOR="${GCE_ACCELERATOR:-type=nvidia-tesla-t4,count=1}"
+GCE_ACCELERATOR="${GCE_ACCELERATOR:-type=nvidia-tesla-t4,count=2}"
 GCE_IMAGE_FAMILY="${GCE_IMAGE_FAMILY:-common-cu129-ubuntu-2404-nvidia-580}"
 GCE_IMAGE_PROJECT="${GCE_IMAGE_PROJECT:-deeplearning-platform-release}"
 K8S_VERSION="${K8S_VERSION:-v1.35.0}"
@@ -188,8 +188,16 @@ sudo nvidia-ctk runtime configure --runtime=docker --set-as-default --cdi.enable
 sudo nvidia-ctk config --set accept-nvidia-visible-devices-as-volume-mounts=true --in-place
 sudo systemctl restart docker
 
-echo "Verifying Docker GPU access..."
-sudo docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all ubuntu:22.04 nvidia-smi -L || true
+echo "Verifying host GPU driver..."
+nvidia-smi -L
+
+echo "Verifying NVIDIA runtime GPU access..."
+sudo docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all ubuntu:22.04 nvidia-smi -L
+
+# nvkind uses the volume-mount GPU injection path, not just the NVIDIA runtime.
+# Fail early if GPUs are missing before the Kubernetes/DRA tests begin.
+echo "Verifying nvkind-style GPU injection into Docker..."
+sudo docker run --rm -v /dev/null:/var/run/nvidia-container-devices/all ubuntu:22.04 nvidia-smi -L
 
 echo "Installing Helm..."
 curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
@@ -268,8 +276,8 @@ nodes:
     nodeRegistration:
       kubeletExtraArgs:
         feature-gates: "DynamicResourceAllocation=true"
-  {{- range \$gpu := until numGPUs }}
   extraMounts:
+  {{- range \$gpu := until numGPUs }}
   - hostPath: /dev/null
     containerPath: /var/run/nvidia-container-devices/{{ \$gpu }}
   {{- end }}
@@ -284,8 +292,16 @@ sudo -E env PATH="\${PATH}" nvkind cluster create \
 kubectl wait --for=condition=Ready nodes --all --timeout=300s
 kubectl label node --all nvidia.com/gpu.present=true feature.node.kubernetes.io/pci-10de.present=true --overwrite
 
-echo "nvkind cluster GPUs:"
-sudo -E env PATH="\${PATH}" nvkind cluster print-gpus --name ai-conformance-cluster || true
+echo "Checking nvkind GPU visibility against the host..."
+host_uuids=\$(nvidia-smi --query-gpu=uuid --format=csv,noheader | sort)
+kind_uuids=\$(sudo -E env PATH="\${PATH}" nvkind cluster print-gpus --name ai-conformance-cluster \
+  | jq -r '[.[].gpus[].UUID] | sort | .[]')
+if [[ -z "\${kind_uuids}" || "\${host_uuids}" != "\${kind_uuids}" ]]; then
+  echo "ERROR: nvkind worker GPU UUIDs differ from the GCE host GPUs" >&2
+  echo "GCE host: \${host_uuids}" >&2
+  echo "nvkind:   \${kind_uuids}" >&2
+  exit 1
+fi
 kubectl get nodes -o wide
 REMOTE_SCRIPT
 
@@ -329,8 +345,19 @@ cd ~/ai-conformance
 mkdir -p _artifacts
 mapfile -t SETUP_ARGS <"\${HOME}/e2e-test-args"
 
+# Preserve GPU/DRA diagnostics in the Prow log on failure, before VM cleanup.
+trap 'status=\$?; if [ "\$status" -ne 0 ]; then
+  echo "=== GPU E2E FAILURE DIAGNOSTICS ==="
+  kubectl get nodes -o wide || true
+  kubectl get deviceclasses || true
+  kubectl get resourceslices -o yaml || true
+  kubectl get resourceclaims -A -o yaml || true
+  kubectl get pods -n nvidia-dra-driver -o wide || true
+  kubectl get events -A --sort-by=.lastTimestamp | tail -80 || true
+fi' EXIT
+
 echo "Running go test ./test/..."
-go test -v ./test/... \
+go test -v -timeout 40m ./test/... \
     -accelerator-type=nvidia \
     -allocation-mode=auto \
     "\${SETUP_ARGS[@]}" \
