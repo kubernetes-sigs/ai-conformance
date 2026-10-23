@@ -26,7 +26,7 @@ mkdir -p "${ARTIFACTS}"
 DEFAULT_GCE_ZONES="us-central1-b us-central1-c us-central1-a us-east1-c us-west1-b"
 GCE_ZONES="${GCE_ZONE:-$DEFAULT_GCE_ZONES}"
 GCE_MACHINE_TYPE="${GCE_MACHINE_TYPE:-n1-standard-4}"
-GCE_ACCELERATOR="${GCE_ACCELERATOR:-type=nvidia-tesla-t4,count=1}"
+GCE_ACCELERATOR="${GCE_ACCELERATOR:-type=nvidia-tesla-t4,count=2}"
 GCE_IMAGE_FAMILY="${GCE_IMAGE_FAMILY:-common-cu129-ubuntu-2404-nvidia-580}"
 GCE_IMAGE_PROJECT="${GCE_IMAGE_PROJECT:-deeplearning-platform-release}"
 K8S_VERSION="${K8S_VERSION:-v1.35.0}"
@@ -330,7 +330,7 @@ mkdir -p _artifacts
 mapfile -t SETUP_ARGS <"\${HOME}/e2e-test-args"
 
 echo "Running go test ./test/..."
-go test -v ./test/... \
+go test -v -timeout 75m ./test/... \
     -accelerator-type=nvidia \
     -allocation-mode=auto \
     "\${SETUP_ARGS[@]}" \
