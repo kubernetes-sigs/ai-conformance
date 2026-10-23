@@ -357,7 +357,7 @@ trap 'status=\$?; if [ "\$status" -ne 0 ]; then
 fi' EXIT
 
 echo "Running go test ./test/..."
-go test -v -timeout 75m ./test/... \
+go test -v -timeout 40m ./test/... \
     -accelerator-type=nvidia \
     -allocation-mode=auto \
     "\${SETUP_ARGS[@]}" \

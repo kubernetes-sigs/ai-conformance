@@ -72,7 +72,9 @@ Run `go test ./test -args -help` for details on all supported flags.
 
 ### HPA Autoscaling for AI Workloads
 
-`TestHPAAutoscaling` (KAR-0057) verifies that the HorizontalPodAutoscaler scales accelerator-backed Pods on a custom per-Pod metric. It is **skipped by default** and runs when `-hpa-custom-metric-name` is set. A platform that supports the HorizontalPodAutoscaler must be able to scale on custom metrics, so configure the pipeline below and run the test; mark `pod_autoscaling` N/A only if the platform does not support the HorizontalPodAutoscaler at all. The project's own E2E job (`test/e2e/run-e2e-gcp.sh`) provisions one GPU and no custom metrics adapter, so it skips this test.
+`TestHPAAutoscaling` (KAR-0057) verifies that the HorizontalPodAutoscaler scales accelerator-backed Pods on a custom per-Pod metric. It is **skipped by default** and runs when `-hpa-custom-metric-name` is set. A platform that supports the HorizontalPodAutoscaler must be able to scale on custom metrics, so configure the pipeline below and run the test; mark `pod_autoscaling` N/A only if the platform does not support the HorizontalPodAutoscaler at all.
+
+The project's GCP E2E job (`test/e2e/run-e2e-gcp.sh`) runs this test with two GPUs. Its setup script (`test/e2e/setup.d/50-prometheus-adapter.sh`) installs prometheus-adapter against the existing kube-prometheus-stack, creates the HPA PodMonitor, and sets `-hpa-custom-metric-name=ai_conformance_hpa_queue_depth` for the test run.
 
 #### What the test does
 
