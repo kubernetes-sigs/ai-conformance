@@ -38,6 +38,7 @@ go test -v -short ./test
 | `TestGangScheduling` | Gang Scheduling | MUST |
 | `TestAcceleratorClusterAutoscaling` | Effective Cluster Autoscaling for Accelerators | MUST |
 | `TestRobustCRDControllerOperation` | Robust CRD and Controller Operation | MUST |
+| `TestAcceleratorPerformanceMetrics` | Accelerator Performance Metrics | MUST |
 | `TestAIServiceMetrics` | AI Job & Inference Service Metrics | MUST |
 | `TestWorkloadSandboxing` | Workload Sandboxing for Untrusted Code | SHOULD |
 
@@ -78,6 +79,20 @@ The autoscaling test observes a preconfigured accelerator pool. The test require
 If your platform provides cluster autoscaling, you must set this flag and run the test. If cluster autoscaling is not supported (N/A), you can leave the flag unset to skip the test.
 
 Scale-up and scale-down can take significantly longer than Go's default test timeout, so it is recommended to use `-timeout 75m` or a larger value. The test also includes configurable observation windows (`-autoscaler-scale-up-timeout`, `-autoscaler-scale-down-timeout`, etc.) since node provisioning times vary heavily by cloud provider. 
+
+Run `go test ./test -args -help` for details on all supported flags.
+
+### Accelerator Performance Metrics
+
+The performance metrics test connects to the Kubernetes cluster via the configured kubeconfig and scrapes the accelerator metrics exporter's `/metrics` endpoint through the Kubernetes API server proxy, so no host-routable access to in-cluster Services is required.
+
+The test is **skipped by default** if `-accelerator-metrics-namespace` or `-accelerator-metrics-service-name` is unset. If your platform provides accelerator metrics via a Prometheus-compatible endpoint, you must set at least:
+
+- `-accelerator-metrics-namespace`: Kubernetes namespace where the exporter Service lives (e.g. `gpu-operator`).
+- `-accelerator-metrics-service-name`: Name of the Kubernetes Service for the exporter (e.g. `dcgm-exporter`).
+- `-accelerator-metrics-service-port`: Port to proxy to (default `9400`).
+
+If your platform does not expose per-accelerator metrics at all, mark `accelerator_metrics` N/A.
 
 Run `go test ./test -args -help` for details on all supported flags.
 
