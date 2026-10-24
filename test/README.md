@@ -40,6 +40,36 @@ go test -v -short ./test
 | `TestRobustCRDControllerOperation` | Robust CRD and Controller Operation | MUST |
 | `TestAIServiceMetrics` | AI Job & Inference Service Metrics | MUST |
 | `TestWorkloadSandboxing` | Workload Sandboxing for Untrusted Code | SHOULD |
+| `TestGPUSharing` | GPU Sharing | SHOULD |
+
+### GPU Sharing
+
+The GPU sharing test (`TestGPUSharing`) verifies the GPU Sharing requirement ([KAR-0003](https://github.com/kubernetes-sigs/ai-conformance/tree/main/kars/0003-gpu-sharing)). It verifies that the platform provides at least one GPU sharing mechanism (DRA shared claims, software-based oversubscription like time-slicing/MPS, or hardware partitioning like MIG) so that multiple workloads that do not need a full dedicated GPU can run concurrently on the same physical accelerator.
+
+By default (`-gpu-sharing-mode=auto`), the test inspects the cluster environment:
+- If DRA is usable (or `-allocation-mode=dra`), it exercises **DRA shared claims**: multiple Pods reference a single `ResourceClaim`, verifying that they are all scheduled and observe the same allocated physical GPU.
+- Otherwise, it scans for nodes advertising fractional or shared extended resources:
+  - Hardware partitions (e.g. `nvidia.com/mig-*` MIG profiles).
+  - Whole-GPU resources oversubscribed via software sharing (e.g. `nvidia.com/gpu` configured with time-slicing or MPS, identified via GPU Feature Discovery node labels).
+
+To target a specific mechanism or resource explicitly:
+```bash
+# Verify DRA shared claims
+go test -v ./test -run TestGPUSharing -gpu-sharing-mode=dra-shared-claim
+
+# Verify time-slicing on nvidia.com/gpu
+go test -v ./test -run TestGPUSharing -gpu-sharing-mode=device-plugin -gpu-sharing-resource=nvidia.com/gpu
+
+# Verify MIG partitioning
+go test -v ./test -run TestGPUSharing -gpu-sharing-mode=device-plugin -gpu-sharing-resource=nvidia.com/mig-1g.5gb
+```
+
+If no GPU sharing mechanism is detected and flags are left unset, the test is skipped with guidance on opting out if GPU sharing is N/A.
+
+The test launches concurrent Pods, verifies that they reach Running simultaneously, runs a vendor GPU health check, and checks the visible physical GPU UUIDs:
+- `SharedResourceExposure`: Verifies that shared/fractional capacity is exposed on schedulable nodes.
+- `ConcurrentWorkloadsShareGPU`: Verifies that concurrent Pods actually share a physical GPU (for MIG, verifying each Pod gets a distinct partition of the same GPU).
+- `AcceleratorHealth`: Verifies that each Pod can successfully query and interact with its accelerator via vendor tooling (`nvidia-smi`).
 
 ### Workload Sandboxing
 
