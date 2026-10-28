@@ -9,6 +9,7 @@ To run these AI Conformance tests, you must have:
 - Workload Sandboxing Test: `TestWorkloadSandboxing` requires a sandboxed `RuntimeClass` (e.g. gVisor or Kata Containers) and is skipped if none is detected. The node that runs the sandboxed workload must also admit a plain, unsandboxed pod pinned to it (the test's control pod).
 - Driver & Runtime Test: `TestAcceleratorDriverRuntimeManagement` additionally pulls a vanilla container image (`ubuntu:22.04` by default; override with `-driver-runtime-image` for air-gapped registries) and expects the platform's container runtime configuration to inject the accelerator vendor's tools (`nvidia-smi` for NVIDIA) into accelerator workloads.
 - HPA Autoscaling Test: `TestHPAAutoscaling` additionally requires capacity to allocate `-hpa-max-replicas` accelerators (default 2, at least 2) to the test at the same time, one per Pod, plus 50m CPU and 64Mi memory per Pod, a custom metrics pipeline configured as described in [HPA Autoscaling for AI Workloads](#hpa-autoscaling-for-ai-workloads), and the ability to pull `docker.io/library/python:3.13-alpine` (or a mirror of it set with `-hpa-workload-image`).
+- GPU Sharing Test: `TestGPUSharing` requires either DRA support with a DeviceClass (e.g. `gpu.nvidia.com`) or nodes advertising fractional or shared GPU resources (time-slicing, MPS, or MIG profiles). The test is skipped automatically when neither is detected and no flags are set. The GPU node must have enough free capacity for `N` concurrent test Pods sharing one physical GPU: by default `N` equals physical GPUs + 1 (to force pigeonholing), or all allocatable units if the physical GPU count is unknown; override with `-gpu-sharing-pods`.
 - Network Access: The test machine must be able to reach the Kubernetes API server.
 
 ## Running the Tests
@@ -43,6 +44,36 @@ go test -v -short ./test
 | `TestAIServiceMetrics` | AI Job & Inference Service Metrics | MUST |
 | `TestWorkloadSandboxing` | Workload Sandboxing for Untrusted Code | SHOULD |
 | `TestHPAAutoscaling` | Effective HPA Autoscaling for AI Workloads | MUST |
+| `TestGPUSharing` | GPU Sharing | SHOULD |
+
+### GPU Sharing
+
+The GPU sharing test (`TestGPUSharing`) verifies the GPU Sharing requirement ([KAR-0003](https://github.com/kubernetes-sigs/ai-conformance/tree/main/kars/0003-gpu-sharing)). It verifies that the platform provides at least one GPU sharing mechanism (DRA shared claims, software-based oversubscription like time-slicing/MPS, or hardware partitioning like MIG) so that multiple workloads that do not need a full dedicated GPU can run concurrently on the same physical accelerator.
+
+By default (`-gpu-sharing-mode=auto`), the test inspects the cluster environment:
+- If DRA is usable (or `-allocation-mode=dra`), it exercises **DRA shared claims**: multiple Pods reference a single `ResourceClaim`, verifying that they are all scheduled and observe the same allocated physical GPU.
+- Otherwise, it scans for nodes advertising fractional or shared extended resources:
+  - Hardware partitions (e.g. `nvidia.com/mig-*` MIG profiles).
+  - Whole-GPU resources oversubscribed via software sharing (e.g. `nvidia.com/gpu` configured with time-slicing or MPS, identified via GPU Feature Discovery node labels).
+
+To target a specific mechanism or resource explicitly:
+```bash
+# Verify DRA shared claims
+go test -v ./test -run TestGPUSharing -gpu-sharing-mode=dra-shared-claim
+
+# Verify time-slicing on nvidia.com/gpu
+go test -v ./test -run TestGPUSharing -gpu-sharing-mode=device-plugin -gpu-sharing-resource=nvidia.com/gpu
+
+# Verify MIG partitioning
+go test -v ./test -run TestGPUSharing -gpu-sharing-mode=device-plugin -gpu-sharing-resource=nvidia.com/mig-1g.5gb
+```
+
+If no GPU sharing mechanism is detected and flags are left unset, the test is skipped with guidance on opting out if GPU sharing is N/A.
+
+The test launches concurrent Pods, verifies that they reach Running simultaneously, runs a vendor GPU health check, and checks the visible physical GPU UUIDs:
+- `SharedResourceExposure`: Verifies that shared/fractional capacity is exposed on schedulable nodes.
+- `ConcurrentWorkloadsShareGPU`: Verifies that concurrent Pods actually share a physical GPU (for MIG, verifying each Pod gets a distinct partition of the same GPU).
+- `AcceleratorHealth`: Verifies that each Pod can successfully query and interact with its accelerator via vendor tooling (`nvidia-smi`).
 
 ### Workload Sandboxing
 

@@ -14,7 +14,7 @@ AI/ML workloads on Kubernetes need GPU sharing because it dramatically improves 
 
 **SHOULD**
 - [x] Describe how users can test it for self-attestation with scripts, documentation, etc
-- [ ] Starting v1.37, new SHOULDs must include proposed automated tests in the automated tests section below
+- [x] Starting v1.37, new SHOULDs must include proposed automated tests in the automated tests section below
 
 **MUST**
 - [ ] Starting v1.37, new MUSTs must include automated tests that have been added to the AI conformance test suite
@@ -51,6 +51,7 @@ The automated tests will default to checking common accelerators (~80% of platfo
 ## Implementation History
 
 2025-11-19: KAR created
+2026-10-21: Add automated conformance test TestGPUSharing
 
 ## Related KARs
 
