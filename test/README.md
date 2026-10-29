@@ -43,6 +43,7 @@ go test -v -short ./test
 | `TestAIServiceMetrics` | AI Job & Inference Service Metrics | MUST |
 | `TestWorkloadSandboxing` | Workload Sandboxing for Untrusted Code | SHOULD |
 | `TestHPAAutoscaling` | Effective HPA Autoscaling for AI Workloads | MUST |
+| `TestGatewayAPIInference` | Gateway API for AI Inference | MUST |
 
 ### Workload Sandboxing
 
@@ -115,6 +116,16 @@ Example with kube-prometheus-stack:
 go test -v ./test -run TestAIServiceMetrics -args \
   -service-metrics-prometheus-service=monitoring/prometheus-operated:9090 \
   -service-metrics-scrape-labels=release=kube-prometheus-stack
+```
+
+### Gateway API for AI Inference
+
+The Gateway API test (`TestGatewayAPIInference`, requirement `networking.ai_inference`) deploys two inference backends behind a `gateway.networking.k8s.io/v1` `Gateway` and `HTTPRoute`. The route sends requests with the header `OpenAI-Project: ai-conformance-canary` to the canary model version `model-v2` and splits all other requests 70/30 between `model-v1` and `model-v2`. After the `Gateway` is `Accepted` and `Programmed` with an address and the `HTTPRoute` is `Accepted` with `ResolvedRefs`, a probe Pod in the cluster sends traffic to the `Gateway` address. The test checks that every header-matched request reaches `model-v2`, and that 500 requests split within 5% of the weights in at least one of ten rounds, once three consecutive requests have been routed. The weights, request count, tolerance and retries follow the upstream Gateway API v1.6.3 `HTTPRouteWeight` conformance test.
+
+By default the test uses the first `Accepted` `GatewayClass` by name and is skipped if the Gateway API is not served or no class is `Accepted`; it logs the chosen class and the other `Accepted` classes. Use `-gateway-api-class` to choose a class; the address must be reachable from Pods in the cluster. With a slow load balancer, raise `-gateway-api-timeout` (default 10m). `run-e2e-gcp.sh` runs this test with agentgateway installed by `test/e2e/setup.d/50-agentgateway.sh`, which creates a `GatewayClass` whose Gateways get `ClusterIP` Services because kind has no load balancer.
+
+```bash
+go test -v ./test -run TestGatewayAPIInference -args -gateway-api-class=<class>
 ```
 
 ### HPA Autoscaling for AI Workloads

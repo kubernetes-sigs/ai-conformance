@@ -667,6 +667,26 @@ func buildTestPod(ns, name string, containers []corev1.Container, pc testPodConf
 	return pod, nil
 }
 
+// restrictedPodSecurityContext and restrictedContainerSecurityContext satisfy
+// the restricted Pod Security Standard for unprivileged workload Pods.
+func restrictedPodSecurityContext() *corev1.PodSecurityContext {
+	nonRoot := true
+	uid := int64(65534)
+	return &corev1.PodSecurityContext{
+		RunAsNonRoot:   &nonRoot,
+		RunAsUser:      &uid,
+		SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+	}
+}
+
+func restrictedContainerSecurityContext() *corev1.SecurityContext {
+	noEscalation := false
+	return &corev1.SecurityContext{
+		AllowPrivilegeEscalation: &noEscalation,
+		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+	}
+}
+
 func createTestPod(ctx context.Context, t *testing.T, c kubernetes.Interface, pod *corev1.Pod) {
 	t.Helper()
 	if _, err := c.CoreV1().Pods(pod.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
