@@ -155,8 +155,8 @@ func TestBuildGatewayAPIProbe(t *testing.T) {
 		for _, e := range pod.Spec.Containers[0].Env {
 			env[e.Name] = e.Value
 		}
-		if env["URL"] != want || env["READY_SECONDS"] != "600" {
-			t.Fatalf("env for %s = %v, want URL %q and READY_SECONDS 600", addr, env, want)
+		if env["URL"] != want || env["READY_SECONDS"] != "600" || env["WEIGHT_V1"] != "0.7" || env["TOLERANCE"] != "0.05" {
+			t.Fatalf("env for %s = %v, want URL %q, READY_SECONDS 600, WEIGHT_V1 0.7 and TOLERANCE 0.05", addr, env, want)
 		}
 	}
 }
@@ -204,19 +204,21 @@ func TestCheckWeightedRounds(t *testing.T) {
 
 func TestGatewayAPIBudget(t *testing.T) {
 	tests := []struct {
-		name    string
-		timeout time.Duration
-		left    time.Duration
-		want    time.Duration
-		ok      bool
+		name     string
+		timeout  time.Duration
+		left     time.Duration
+		overhead time.Duration
+		want     time.Duration
+		ok       bool
 	}{
-		{name: "ample time", timeout: 10 * time.Minute, left: 40 * time.Minute, want: 10 * time.Minute, ok: true},
-		{name: "capped", timeout: 10 * time.Minute, left: 12 * time.Minute, want: 4 * time.Minute, ok: true},
-		{name: "only overhead left", timeout: 10 * time.Minute, left: 8 * time.Minute},
+		{name: "ample time", timeout: 10 * time.Minute, left: 40 * time.Minute, overhead: 8 * time.Minute, want: 10 * time.Minute, ok: true},
+		{name: "capped", timeout: 10 * time.Minute, left: 12 * time.Minute, overhead: 8 * time.Minute, want: 4 * time.Minute, ok: true},
+		{name: "capped after Pods started", timeout: 10 * time.Minute, left: 12 * time.Minute, overhead: 5 * time.Minute, want: 7 * time.Minute, ok: true},
+		{name: "only overhead left", timeout: 10 * time.Minute, left: 8 * time.Minute, overhead: 8 * time.Minute},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := gatewayAPIBudget(tt.timeout, tt.left)
+			got, err := gatewayAPIBudget(tt.timeout, tt.left, tt.overhead)
 			if (err == nil) != tt.ok || got != tt.want {
 				t.Fatalf("got %v, err %v; want %v, ok %v", got, err, tt.want, tt.ok)
 			}

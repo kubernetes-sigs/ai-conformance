@@ -104,13 +104,10 @@ func TestGatewayAPIInference(t *testing.T) {
 	} else {
 		t.Logf("Auto-detected GatewayClass %s, the first by name of the Accepted classes %v; set -gateway-api-class to choose another", class, accepted)
 	}
-	budget := *gatewayAPITimeout
-	if d, ok := t.Deadline(); ok {
-		if budget, err = gatewayAPIBudget(budget, time.Until(d)); err != nil {
+	d, hasDeadline := t.Deadline()
+	if hasDeadline {
+		if _, err := gatewayAPIBudget(*gatewayAPITimeout, time.Until(d), 2*gatewayAPIPodTimeout+gatewayAPICleanupReserve); err != nil {
 			t.Fatalf("ENVIRONMENT ERROR: %v", err)
-		}
-		if budget < *gatewayAPITimeout {
-			t.Logf("Capping -gateway-api-timeout at %v to finish within the go test -timeout", budget)
 		}
 	}
 
@@ -145,14 +142,32 @@ func TestGatewayAPIInference(t *testing.T) {
 		t.Fatalf("ENVIRONMENT ERROR: Inference backends did not start: %v", err)
 	}
 
+	budget := *gatewayAPITimeout
+	if hasDeadline {
+		if budget, err = gatewayAPIBudget(budget, time.Until(d), gatewayAPIPodTimeout+gatewayAPICleanupReserve); err != nil {
+			t.Fatalf("ENVIRONMENT ERROR: %v", err)
+		}
+	}
+	capped := budget < *gatewayAPITimeout
+	if capped {
+		t.Logf("Capping -gateway-api-timeout at %v to finish within the go test -timeout", budget)
+	}
+	waitFailed := func(err error) {
+		t.Helper()
+		if capped && (wait.Interrupted(err) || strings.Contains(err.Error(), "NOT_READY")) {
+			t.Fatalf("ENVIRONMENT ERROR: %v; -gateway-api-timeout was capped at %v by the go test -timeout, raise -timeout", err, budget)
+		}
+		t.Fatalf("FAIL: %v", err)
+	}
+
 	t.Logf("Waiting up to %v for the Gateway to be Programmed, the HTTPRoute Accepted and traffic routed...", budget)
 	deadline := time.Now().Add(budget)
 	addr, err := waitForGatewayProgrammed(ctx, dyn, namespace, class, time.Until(deadline))
 	if err != nil {
-		t.Fatalf("FAIL: %v", err)
+		waitFailed(err)
 	}
 	if err := waitForHTTPRouteAccepted(ctx, dyn, namespace, time.Until(deadline)); err != nil {
-		t.Fatalf("FAIL: %v", err)
+		waitFailed(err)
 	}
 	t.Logf("Gateway address: %s", addr)
 
@@ -160,7 +175,7 @@ func TestGatewayAPIInference(t *testing.T) {
 	createTestPod(ctx, t, clientset, buildGatewayAPIProbe(namespace, addr, time.Until(deadline)))
 	logs, err := waitForProbeLogs(ctx, clientset, namespace, time.Until(deadline)+gatewayAPIPodTimeout)
 	if err != nil {
-		t.Fatalf("FAIL: %v", err)
+		waitFailed(err)
 	}
 	header, weighted, err := parseGatewayProbeLogs(logs)
 	if err != nil {
@@ -178,10 +193,9 @@ func TestGatewayAPIInference(t *testing.T) {
 	}
 }
 
-// gatewayAPIBudget caps timeout so that the backend and probe Pod waits and
-// cleanup still fit in the time left before the go test -timeout.
-func gatewayAPIBudget(timeout, left time.Duration) (time.Duration, error) {
-	overhead := 2*gatewayAPIPodTimeout + gatewayAPICleanupReserve
+// gatewayAPIBudget caps timeout so that the remaining Pod waits and cleanup,
+// given as overhead, still fit in the time left before the go test -timeout.
+func gatewayAPIBudget(timeout, left, overhead time.Duration) (time.Duration, error) {
 	if left <= overhead {
 		return 0, fmt.Errorf("the go test -timeout leaves %v, not more than the %v needed for Pods and cleanup; raise -timeout",
 			left.Round(time.Second), overhead)
@@ -410,10 +424,11 @@ Server(("::" if Server.address_family == socket.AF_INET6 else "", int(os.environ
 `
 
 // gatewayAPIProbeScript waits until the route is live, then prints the
-// backend counts for header-matched requests and for each weighted round.
+// backend counts for header-matched requests and for each weighted round,
+// stopping at the first round within the tolerance.
 const gatewayAPIProbeScript = `import os, sys, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
-URL, A, B = os.environ["URL"], os.environ["BACKEND_A"], os.environ["BACKEND_B"]
+URL, MODEL_V1, MODEL_V2 = os.environ["URL"], os.environ["MODEL_V1"], os.environ["MODEL_V2"]
 HEADER = {os.environ["HEADER_NAME"]: os.environ["HEADER_VALUE"]}
 BODY = b'{"model":"ai-conformance","messages":[{"role":"user","content":"hello"}]}'
 def call(extra):
@@ -423,25 +438,29 @@ def call(extra):
             return r.read().decode().strip()
     except Exception as e:
         return "error: %s" % e
-def counts(n, extra):
+def counts(kind, n, extra):
     with ThreadPoolExecutor(10) as ex:
         res = list(ex.map(lambda _: call(extra), range(n)))
-    return "%s=%d %s=%d other=%d" % (A, res.count(A), B, res.count(B), n - res.count(A) - res.count(B))
+    count_v1, count_v2 = res.count(MODEL_V1), res.count(MODEL_V2)
+    print("%s %s=%d %s=%d other=%d" % (kind, MODEL_V1, count_v1, MODEL_V2, count_v2, n - count_v1 - count_v2))
+    return count_v1, count_v2, n - count_v1 - count_v2
 deadline = time.time() + float(os.environ["READY_SECONDS"])
 seen, ok = set(), 0
 while True:
     h, w = call(HEADER), call({})
     seen.add(w)
-    ok = ok + 1 if h == B and w in (A, B) else 0
-    if ok >= int(os.environ["CONSECUTIVE"]) and {A, B} <= seen:
+    ok = ok + 1 if h == MODEL_V2 and w in (MODEL_V1, MODEL_V2) else 0
+    if ok >= int(os.environ["CONSECUTIVE"]) and {MODEL_V1, MODEL_V2} <= seen:
         break
     if time.time() > deadline:
         print("NOT_READY after %ss header=%r default=%r seen=%r" % (os.environ["READY_SECONDS"], h, w, sorted(seen)))
         sys.exit(1)
     time.sleep(2)
-print("HEADER " + counts(int(os.environ["HEADER_REQUESTS"]), HEADER))
+counts("HEADER", int(os.environ["HEADER_REQUESTS"]), HEADER)
 for _ in range(int(os.environ["ROUNDS"])):
-    print("WEIGHTED " + counts(int(os.environ["REQUESTS"]), {}))
+    count_v1, count_v2, other = counts("WEIGHTED", int(os.environ["REQUESTS"]), {})
+    if other == 0 and count_v1 + count_v2 > 0 and abs(count_v1 / (count_v1 + count_v2) - float(os.environ["WEIGHT_V1"])) <= float(os.environ["TOLERANCE"]):
+        break
 `
 
 func gatewayAPIPod(ns, name string, labels map[string]string, c corev1.Container) *corev1.Pod {
@@ -490,13 +509,15 @@ func buildGatewayAPIProbe(ns, addr string, ready time.Duration) *corev1.Pod {
 		Command: []string{"python3", "-u", "-c", gatewayAPIProbeScript},
 		Env: []corev1.EnvVar{
 			{Name: "URL", Value: url},
-			{Name: "BACKEND_A", Value: gatewayAPIModelV1},
-			{Name: "BACKEND_B", Value: gatewayAPIModelV2},
+			{Name: "MODEL_V1", Value: gatewayAPIModelV1},
+			{Name: "MODEL_V2", Value: gatewayAPIModelV2},
 			{Name: "HEADER_NAME", Value: gatewayAPIHeaderName},
 			{Name: "HEADER_VALUE", Value: gatewayAPIHeaderValue},
 			{Name: "HEADER_REQUESTS", Value: strconv.Itoa(gatewayAPIHeaderRequests)},
 			{Name: "REQUESTS", Value: strconv.Itoa(gatewayAPIRequests)},
 			{Name: "ROUNDS", Value: strconv.Itoa(gatewayAPIRounds)},
+			{Name: "WEIGHT_V1", Value: strconv.FormatFloat(float64(gatewayAPIWeightA)/float64(gatewayAPIWeightA+gatewayAPIWeightB), 'f', -1, 64)},
+			{Name: "TOLERANCE", Value: strconv.FormatFloat(gatewayAPITolerance, 'f', -1, 64)},
 			{Name: "CONSECUTIVE", Value: strconv.Itoa(gatewayAPIConsecutive)},
 			{Name: "READY_SECONDS", Value: strconv.Itoa(int(ready.Seconds()))},
 		},
