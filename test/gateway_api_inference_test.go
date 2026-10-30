@@ -46,7 +46,8 @@ const (
 	gatewayAPIConsecutive    = 3
 	gatewayAPITolerance      = 0.05
 	gatewayAPIPodTimeout     = 3 * time.Minute
-	gatewayAPICleanupReserve = 2 * time.Minute
+	gatewayAPIDeleteTimeout  = 5 * time.Minute
+	gatewayAPICleanupReserve = gatewayAPIDeleteTimeout + 2*time.Minute
 	gatewayAPINotConfigured  = "gateway API test is not configured; networking.ai_inference is a MUST, so install a Gateway API implementation as described in test/README.md or set -gateway-api-class=<class>"
 )
 
@@ -116,6 +117,9 @@ func TestGatewayAPIInference(t *testing.T) {
 		t.Fatalf("Failed to create namespace %s: %v", namespace, err)
 	}
 	t.Cleanup(func() {
+		if err := deleteGatewayAndWait(ctx, dyn, namespace); err != nil {
+			t.Errorf("CLEANUP FAILURE: %v", err)
+		}
 		if err := deleteNamespaceAndWait(ctx, t, clientset, namespace); err != nil {
 			t.Errorf("CLEANUP FAILURE: %v. Please ensure this namespace is terminated manually to avoid resource leaks.", err)
 		}
@@ -190,6 +194,9 @@ func TestGatewayAPIInference(t *testing.T) {
 		t.Errorf("FAIL: %v", err)
 	} else {
 		t.Logf("Weighted traffic split %d/%d within %.0f%%: %v", gatewayAPIWeightA, gatewayAPIWeightB, gatewayAPITolerance*100, weighted)
+	}
+	if t.Failed() {
+		t.Logf("Probe logs:\n%s", logs)
 	}
 }
 
@@ -329,6 +336,36 @@ func waitForHTTPRouteAccepted(ctx context.Context, dyn dynamic.Interface, ns str
 	return nil
 }
 
+// deleteGatewayAndWait deletes the HTTPRoute and Gateway and waits for the
+// Gateway to be gone, so that finalizers on it do not hold up the namespace.
+func deleteGatewayAndWait(ctx context.Context, dyn dynamic.Interface, ns string) error {
+	if err := dyn.Resource(httpRouteGVR).Namespace(ns).Delete(ctx, gatewayAPIRouteName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete HTTPRoute %s: %w", gatewayAPIRouteName, err)
+	}
+	if err := dyn.Resource(gatewayGVR).Namespace(ns).Delete(ctx, gatewayAPIGatewayName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete Gateway %s: %w", gatewayAPIGatewayName, err)
+	}
+	var lastAPIError error
+	err := wait.PollUntilContextTimeout(ctx, 2*time.Second, gatewayAPIDeleteTimeout, true, func(ctx context.Context) (bool, error) {
+		_, err := dyn.Resource(gatewayGVR).Namespace(ns).Get(ctx, gatewayAPIGatewayName, metav1.GetOptions{})
+		switch {
+		case apierrors.IsNotFound(err):
+			return true, nil
+		case err == nil, isRetryableAPIError(err):
+			lastAPIError = err
+			return false, nil
+		case ctx.Err() != nil:
+			return false, ctx.Err()
+		default:
+			return false, err
+		}
+	})
+	if err != nil {
+		return fmt.Errorf("Gateway %s was not deleted within %v%s: %w", gatewayAPIGatewayName, gatewayAPIDeleteTimeout, lastAPIErrorSuffix(lastAPIError), err)
+	}
+	return nil
+}
+
 // pollGatewayAPIObject returns the last observed object, also on timeout.
 func pollGatewayAPIObject(ctx context.Context, dyn dynamic.Interface, gvr schema.GroupVersionResource, ns, name string, timeout time.Duration, done func(*unstructured.Unstructured) bool) (*unstructured.Unstructured, error) {
 	last := &unstructured.Unstructured{Object: map[string]any{}}
@@ -403,6 +440,7 @@ func buildHTTPRoute(ns string) *unstructured.Unstructured {
 const gatewayAPIBackendScript = `import http.server, os, socket
 NAME = os.environ["BACKEND"].encode()
 class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
     def reply(self):
         self.rfile.read(int(self.headers.get("Content-Length") or 0))
         self.send_response(200)
@@ -416,6 +454,7 @@ class H(http.server.BaseHTTPRequestHandler):
 # Dual-stack when the node has IPv6, so IPv4-only and IPv6-only clusters both work.
 class Server(http.server.ThreadingHTTPServer):
     address_family = socket.AF_INET6 if socket.has_dualstack_ipv6() else socket.AF_INET
+    request_queue_size = 128
     def server_bind(self):
         if self.address_family == socket.AF_INET6:
             self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
@@ -424,8 +463,9 @@ Server(("::" if Server.address_family == socket.AF_INET6 else "", int(os.environ
 `
 
 // gatewayAPIProbeScript waits until the route is live, then prints the
-// backend counts for header-matched requests and for each weighted round,
-// stopping at the first round within the tolerance.
+// backend counts for each header-matched round, stopping at the first without
+// errors, and for each weighted round, stopping at the first within the
+// tolerance.
 const gatewayAPIProbeScript = `import os, sys, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 URL, MODEL_V1, MODEL_V2 = os.environ["URL"], os.environ["MODEL_V1"], os.environ["MODEL_V2"]
@@ -442,8 +482,11 @@ def counts(kind, n, extra):
     with ThreadPoolExecutor(10) as ex:
         res = list(ex.map(lambda _: call(extra), range(n)))
     count_v1, count_v2 = res.count(MODEL_V1), res.count(MODEL_V2)
-    print("%s %s=%d %s=%d other=%d" % (kind, MODEL_V1, count_v1, MODEL_V2, count_v2, n - count_v1 - count_v2))
-    return count_v1, count_v2, n - count_v1 - count_v2
+    other = [r for r in res if r not in (MODEL_V1, MODEL_V2)]
+    print("%s %s=%d %s=%d other=%d" % (kind, MODEL_V1, count_v1, MODEL_V2, count_v2, len(other)))
+    if other:
+        print("SAMPLE_ERROR %s" % other[0])
+    return count_v1, count_v2, len(other)
 deadline = time.time() + float(os.environ["READY_SECONDS"])
 seen, ok = set(), 0
 while True:
@@ -456,7 +499,9 @@ while True:
         print("NOT_READY after %ss header=%r default=%r seen=%r" % (os.environ["READY_SECONDS"], h, w, sorted(seen)))
         sys.exit(1)
     time.sleep(2)
-counts("HEADER", int(os.environ["HEADER_REQUESTS"]), HEADER)
+for _ in range(int(os.environ["ROUNDS"])):
+    if counts("HEADER", int(os.environ["HEADER_REQUESTS"]), HEADER)[2] == 0:
+        break
 for _ in range(int(os.environ["ROUNDS"])):
     count_v1, count_v2, other = counts("WEIGHTED", int(os.environ["REQUESTS"]), {})
     if other == 0 and count_v1 + count_v2 > 0 and abs(count_v1 / (count_v1 + count_v2) - float(os.environ["WEIGHT_V1"])) <= float(os.environ["TOLERANCE"]):
@@ -559,8 +604,8 @@ func waitForProbeLogs(ctx context.Context, c kubernetes.Interface, ns string, ti
 
 type backendCounts map[string]int
 
-// parseGatewayProbeLogs reads the HEADER line and the WEIGHTED lines printed
-// by gatewayAPIProbeScript.
+// parseGatewayProbeLogs reads the last HEADER line and the WEIGHTED lines
+// printed by gatewayAPIProbeScript.
 func parseGatewayProbeLogs(logs string) (backendCounts, []backendCounts, error) {
 	var header backendCounts
 	var weighted []backendCounts

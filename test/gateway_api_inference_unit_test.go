@@ -162,11 +162,11 @@ func TestBuildGatewayAPIProbe(t *testing.T) {
 }
 
 func TestParseGatewayProbeLogs(t *testing.T) {
-	header, weighted, err := parseGatewayProbeLogs("HEADER model-v1=0 model-v2=20 other=0\nWEIGHTED model-v1=354 model-v2=146 other=0\nWEIGHTED model-v1=340 model-v2=160 other=0\n")
+	header, weighted, err := parseGatewayProbeLogs("HEADER model-v1=0 model-v2=19 other=1\nSAMPLE_ERROR error: HTTP Error 502: Bad Gateway\nHEADER model-v1=0 model-v2=20 other=0\nWEIGHTED model-v1=354 model-v2=145 other=1\nSAMPLE_ERROR error: timed out\nWEIGHTED model-v1=340 model-v2=160 other=0\n")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if header[gatewayAPIModelV2] != 20 || len(weighted) != 2 || weighted[1][gatewayAPIModelV1] != 340 {
+	if header[gatewayAPIModelV2] != 20 || header["other"] != 0 || len(weighted) != 2 || weighted[1][gatewayAPIModelV1] != 340 {
 		t.Fatalf("got %v %v", header, weighted)
 	}
 	for _, logs := range []string{"", "HEADER model-v1=0 model-v2=20 other=0", "HEADER model-v1=x\nWEIGHTED model-v1=1"} {
@@ -211,10 +211,10 @@ func TestGatewayAPIBudget(t *testing.T) {
 		want     time.Duration
 		ok       bool
 	}{
-		{name: "ample time", timeout: 10 * time.Minute, left: 40 * time.Minute, overhead: 8 * time.Minute, want: 10 * time.Minute, ok: true},
-		{name: "capped", timeout: 10 * time.Minute, left: 12 * time.Minute, overhead: 8 * time.Minute, want: 4 * time.Minute, ok: true},
-		{name: "capped after Pods started", timeout: 10 * time.Minute, left: 12 * time.Minute, overhead: 5 * time.Minute, want: 7 * time.Minute, ok: true},
-		{name: "only overhead left", timeout: 10 * time.Minute, left: 8 * time.Minute, overhead: 8 * time.Minute},
+		{name: "ample time", timeout: 10 * time.Minute, left: 40 * time.Minute, overhead: 13 * time.Minute, want: 10 * time.Minute, ok: true},
+		{name: "capped", timeout: 10 * time.Minute, left: 17 * time.Minute, overhead: 13 * time.Minute, want: 4 * time.Minute, ok: true},
+		{name: "capped after Pods started", timeout: 10 * time.Minute, left: 17 * time.Minute, overhead: 10 * time.Minute, want: 7 * time.Minute, ok: true},
+		{name: "only overhead left", timeout: 10 * time.Minute, left: 13 * time.Minute, overhead: 13 * time.Minute},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
