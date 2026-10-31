@@ -144,6 +144,12 @@ func getClientset(t *testing.T) kubernetes.Interface {
 
 func deleteNamespaceAndWait(ctx context.Context, t *testing.T, c kubernetes.Interface, namespace string) error {
 	t.Helper()
+	return deleteNamespaceAndWaitTimeout(ctx, t, c, namespace, time.Minute)
+}
+
+// deleteNamespaceAndWaitTimeout waits up to timeout for the namespace to terminate.
+func deleteNamespaceAndWaitTimeout(ctx context.Context, t *testing.T, c kubernetes.Interface, namespace string, timeout time.Duration) error {
+	t.Helper()
 	t.Logf("Cleaning up namespace %s...", namespace)
 	var lastAPIError error
 	err := wait.PollUntilContextTimeout(ctx, 2*time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
@@ -163,7 +169,7 @@ func deleteNamespaceAndWait(ctx context.Context, t *testing.T, c kubernetes.Inte
 		return fmt.Errorf("failed to request deletion of namespace %s%s: %w", namespace, lastAPIErrorSuffix(lastAPIError), err)
 	}
 
-	err = wait.PollUntilContextTimeout(ctx, 2*time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
+	err = wait.PollUntilContextTimeout(ctx, 2*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
 		_, err := c.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{})
 		switch {
 		case apierrors.IsNotFound(err):

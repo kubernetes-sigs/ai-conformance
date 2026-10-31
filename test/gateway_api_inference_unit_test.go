@@ -211,10 +211,10 @@ func TestGatewayAPIBudget(t *testing.T) {
 		want     time.Duration
 		ok       bool
 	}{
-		{name: "ample time", timeout: 10 * time.Minute, left: 40 * time.Minute, overhead: 13 * time.Minute, want: 10 * time.Minute, ok: true},
-		{name: "capped", timeout: 10 * time.Minute, left: 17 * time.Minute, overhead: 13 * time.Minute, want: 4 * time.Minute, ok: true},
-		{name: "capped after Pods started", timeout: 10 * time.Minute, left: 17 * time.Minute, overhead: 10 * time.Minute, want: 7 * time.Minute, ok: true},
-		{name: "only overhead left", timeout: 10 * time.Minute, left: 13 * time.Minute, overhead: 13 * time.Minute},
+		{name: "ample time", timeout: 10 * time.Minute, left: 40 * time.Minute, overhead: 17 * time.Minute, want: 10 * time.Minute, ok: true},
+		{name: "capped", timeout: 10 * time.Minute, left: 21 * time.Minute, overhead: 17 * time.Minute, want: 4 * time.Minute, ok: true},
+		{name: "capped after Pods started", timeout: 10 * time.Minute, left: 21 * time.Minute, overhead: 14 * time.Minute, want: 7 * time.Minute, ok: true},
+		{name: "only overhead left", timeout: 10 * time.Minute, left: 17 * time.Minute, overhead: 17 * time.Minute},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

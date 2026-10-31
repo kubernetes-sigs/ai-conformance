@@ -47,7 +47,7 @@ const (
 	gatewayAPITolerance      = 0.05
 	gatewayAPIPodTimeout     = 3 * time.Minute
 	gatewayAPIDeleteTimeout  = 5 * time.Minute
-	gatewayAPICleanupReserve = gatewayAPIDeleteTimeout + 2*time.Minute
+	gatewayAPICleanupReserve = 2*gatewayAPIDeleteTimeout + time.Minute
 	gatewayAPINotConfigured  = "gateway API test is not configured; networking.ai_inference is a MUST, so install a Gateway API implementation as described in test/README.md or set -gateway-api-class=<class>"
 )
 
@@ -120,7 +120,7 @@ func TestGatewayAPIInference(t *testing.T) {
 		if err := deleteGatewayAndWait(ctx, dyn, namespace); err != nil {
 			t.Errorf("CLEANUP FAILURE: %v", err)
 		}
-		if err := deleteNamespaceAndWait(ctx, t, clientset, namespace); err != nil {
+		if err := deleteNamespaceAndWaitTimeout(ctx, t, clientset, namespace, gatewayAPIDeleteTimeout); err != nil {
 			t.Errorf("CLEANUP FAILURE: %v. Please ensure this namespace is terminated manually to avoid resource leaks.", err)
 		}
 	})
@@ -446,6 +446,7 @@ class H(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", str(len(NAME)))
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(NAME)
     do_GET = do_POST = reply
@@ -466,18 +467,22 @@ Server(("::" if Server.address_family == socket.AF_INET6 else "", int(os.environ
 // backend counts for each header-matched round, stopping at the first without
 // errors, and for each weighted round, stopping at the first within the
 // tolerance.
-const gatewayAPIProbeScript = `import os, sys, time, urllib.request
+const gatewayAPIProbeScript = `import os, sys, time, urllib.error, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 URL, MODEL_V1, MODEL_V2 = os.environ["URL"], os.environ["MODEL_V1"], os.environ["MODEL_V2"]
 HEADER = {os.environ["HEADER_NAME"]: os.environ["HEADER_VALUE"]}
 BODY = b'{"model":"ai-conformance","messages":[{"role":"user","content":"hello"}]}'
 def call(extra):
     req = urllib.request.Request(URL, data=BODY, headers={"Content-Type": "application/json", **extra})
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return r.read().decode().strip()
-    except Exception as e:
-        return "error: %s" % e
+    for _ in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.read().decode().strip()
+        except urllib.error.HTTPError as e:
+            return "error: %s" % e
+        except Exception as e:
+            err = e
+    return "error: %s" % err
 def counts(kind, n, extra):
     with ThreadPoolExecutor(10) as ex:
         res = list(ex.map(lambda _: call(extra), range(n)))
@@ -502,10 +507,12 @@ while True:
 for _ in range(int(os.environ["ROUNDS"])):
     if counts("HEADER", int(os.environ["HEADER_REQUESTS"]), HEADER)[2] == 0:
         break
+    time.sleep(5)
 for _ in range(int(os.environ["ROUNDS"])):
     count_v1, count_v2, other = counts("WEIGHTED", int(os.environ["REQUESTS"]), {})
     if other == 0 and count_v1 + count_v2 > 0 and abs(count_v1 / (count_v1 + count_v2) - float(os.environ["WEIGHT_V1"])) <= float(os.environ["TOLERANCE"]):
         break
+    time.sleep(5)
 `
 
 func gatewayAPIPod(ns, name string, labels map[string]string, c corev1.Container) *corev1.Pod {
