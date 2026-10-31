@@ -144,6 +144,12 @@ func getClientset(t *testing.T) kubernetes.Interface {
 
 func deleteNamespaceAndWait(ctx context.Context, t *testing.T, c kubernetes.Interface, namespace string) error {
 	t.Helper()
+	return deleteNamespaceAndWaitTimeout(ctx, t, c, namespace, time.Minute)
+}
+
+// deleteNamespaceAndWaitTimeout waits up to timeout for the namespace to terminate.
+func deleteNamespaceAndWaitTimeout(ctx context.Context, t *testing.T, c kubernetes.Interface, namespace string, timeout time.Duration) error {
+	t.Helper()
 	t.Logf("Cleaning up namespace %s...", namespace)
 	var lastAPIError error
 	err := wait.PollUntilContextTimeout(ctx, 2*time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
@@ -163,7 +169,7 @@ func deleteNamespaceAndWait(ctx context.Context, t *testing.T, c kubernetes.Inte
 		return fmt.Errorf("failed to request deletion of namespace %s%s: %w", namespace, lastAPIErrorSuffix(lastAPIError), err)
 	}
 
-	err = wait.PollUntilContextTimeout(ctx, 2*time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
+	err = wait.PollUntilContextTimeout(ctx, 2*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
 		_, err := c.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{})
 		switch {
 		case apierrors.IsNotFound(err):
@@ -665,6 +671,26 @@ func buildTestPod(ns, name string, containers []corev1.Container, pc testPodConf
 	}
 
 	return pod, nil
+}
+
+// restrictedPodSecurityContext and restrictedContainerSecurityContext satisfy
+// the restricted Pod Security Standard for unprivileged workload Pods.
+func restrictedPodSecurityContext() *corev1.PodSecurityContext {
+	nonRoot := true
+	uid := int64(65534)
+	return &corev1.PodSecurityContext{
+		RunAsNonRoot:   &nonRoot,
+		RunAsUser:      &uid,
+		SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+	}
+}
+
+func restrictedContainerSecurityContext() *corev1.SecurityContext {
+	noEscalation := false
+	return &corev1.SecurityContext{
+		AllowPrivilegeEscalation: &noEscalation,
+		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+	}
 }
 
 func createTestPod(ctx context.Context, t *testing.T, c kubernetes.Interface, pod *corev1.Pod) {
