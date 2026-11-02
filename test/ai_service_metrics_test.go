@@ -289,9 +289,6 @@ Server(("::" if Server.address_family == socket.AF_INET6 else "", PORT), Handler
 
 func buildMetricsWorkload(ns, runID string) (*corev1.Pod, *corev1.Service) {
 	labels := map[string]string{metricsAppLabelKey: metricsWorkloadName}
-	nonRoot := true
-	uid := int64(65534)
-	noEscalation := false
 	deadline := metricsPodDeadlineSeconds(*metricsCollectionTimeout)
 
 	pod := &corev1.Pod{
@@ -300,12 +297,7 @@ func buildMetricsWorkload(ns, runID string) (*corev1.Pod, *corev1.Service) {
 			// A restart resets the counters and invalidates the run, so fail instead.
 			RestartPolicy:         corev1.RestartPolicyNever,
 			ActiveDeadlineSeconds: &deadline,
-			// Restricted Pod Security Standard.
-			SecurityContext: &corev1.PodSecurityContext{
-				RunAsNonRoot:   &nonRoot,
-				RunAsUser:      &uid,
-				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
-			},
+			SecurityContext:       restrictedPodSecurityContext(),
 			Containers: []corev1.Container{{
 				Name:    "server",
 				Image:   metricsWorkloadImage,
@@ -325,10 +317,7 @@ func buildMetricsWorkload(ns, runID string) (*corev1.Pod, *corev1.Service) {
 					},
 					Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("128Mi")},
 				},
-				SecurityContext: &corev1.SecurityContext{
-					AllowPrivilegeEscalation: &noEscalation,
-					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
-				},
+				SecurityContext: restrictedContainerSecurityContext(),
 			}},
 		},
 	}
