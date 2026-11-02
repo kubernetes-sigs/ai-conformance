@@ -33,18 +33,18 @@ go test -v -short ./test
 
 ### Test Cases Covered
 
-| Test Name | Requirement Covered | Requirement Level |
-|-|-|-|
-| `TestAcceleratorDriverRuntimeManagement` | Accelerator Driver & Runtime Management | SHOULD |
-| `TestSecureAcceleratorAccess` | Secure Accelerator Access | MUST |
-| `TestGangScheduling` | Gang Scheduling | MUST |
-| `TestAcceleratorClusterAutoscaling` | Effective Cluster Autoscaling for Accelerators | MUST |
-| `TestRobustCRDControllerOperation` | Robust CRD and Controller Operation | MUST |
-| `TestAcceleratorPerformanceMetrics` | Accelerator Performance Metrics | MUST |
-| `TestAIServiceMetrics` | AI Job & Inference Service Metrics | MUST |
-| `TestWorkloadSandboxing` | Workload Sandboxing for Untrusted Code | SHOULD |
-| `TestHPAAutoscaling` | Effective HPA Autoscaling for AI Workloads | MUST |
-| `TestGatewayAPIInference` | Gateway API for AI Inference | MUST |
+| Test Name | KAR | Manifest Key (`spec.<category>.<id>`) | Requirement Level |
+|---|---|---|---|
+| `TestAcceleratorDriverRuntimeManagement` | [KAR-0001](../kars/0001-accelerator-driver-runtime-management/README.md) | `spec.accelerators.driver_runtime_management` | MUST (v1.38+)<br>_SHOULD (v1.37)_ |
+| `TestGatewayAPIInference` | [KAR-0111](../kars/0111-gateway-api-inference/README.md) | `spec.networking.ai_inference` | MUST |
+| `TestGangScheduling` | [KAR-0053](../kars/0053-gang-scheduling/README.md) | `spec.schedulingOrchestration.gang_scheduling` | MUST |
+| `TestAcceleratorClusterAutoscaling` | [KAR-0055](../kars/0055-cluster-autoscaling-for-accelerators/README.md) | `spec.schedulingOrchestration.cluster_autoscaling` | MUST |
+| `TestHPAAutoscaling` | [KAR-0057](../kars/0057-hpa-autoscaling-for-ai-workloads/README.md) | `spec.schedulingOrchestration.pod_autoscaling` | MUST |
+| `TestAcceleratorPerformanceMetrics` | [KAR-0059](../kars/0059-accelerator-performance-metrics/README.md) | `spec.observability.accelerator_metrics` | MUST |
+| `TestAIServiceMetrics` | [KAR-0061](../kars/0061-ai-job-inference-service-metrics/README.md) | `spec.observability.ai_service_metrics` | MUST |
+| `TestSecureAcceleratorAccess` | [KAR-0049](../kars/0049-secure-accelerator-access/README.md) | `spec.security.secure_accelerator_access` | MUST |
+| `TestWorkloadSandboxing` | [KAR-0020](../kars/0020-workload-sandboxing/README.md) | `spec.security.workload_sandboxing` | MUST (v1.38+)<br>_SHOULD (v1.37)_ |
+| `TestRobustCRDControllerOperation` | [KAR-0063](../kars/0063-robust-crd-controller-operation/README.md) | `spec.operator.robust_controller` | MUST |
 
 ### Workload Sandboxing
 
@@ -57,7 +57,7 @@ go test -v ./test \
   -sandbox-runtime-class=gvisor
 ```
 
-If no sandboxed `RuntimeClass` is detected and none is specified, the test is skipped with guidance on configuring the flag or opting out if the capability is N/A.
+If no sandboxed `RuntimeClass` is detected and none is specified, the test is skipped with guidance on configuring the `-sandbox-runtime-class` flag.
 
 The test runs a probe script in the sandboxed pod and then runs the same script in an unsandboxed control pod pinned to the node the sandboxed pod landed on. The subtests verify observable isolation boundaries:
 - `ProcessIsolation`: Host processes (e.g., `kubelet`, `containerd`) are not visible and the PID namespace is strictly container-scoped.

@@ -33,14 +33,12 @@ This process adopts the Kubernetes Enhancement Proposal (KEP) process as the bas
 - **Requirement removal**: Criteria to remove a requirement is TBD
 
 
-## Designing AI Conformance Tests
+## AI Conformance Tests
 
-Once there is community consensus on a requirement, the next step is to define how to verify it.
-Every requirement should have a corresponding test designed. Starting v1.37, automated tests are prerequisites for new SHOULDs and MUSTs. This test design should be documented as part of the KAR and should be specific enough to be implemented in an automated fashion.
+Each KAR documents how to verify its requirement in its Test Plan section.
+Starting v1.37, new SHOULDs must include proposed automated tests, and new MUSTs must include automated tests that have been added to the AI conformance test suite in [`test/`](test/).
 
-Discussions for how we design AI conformance tests are tracked using the
-[AI Conformance Tests Design](https://github.com/orgs/kubernetes-sigs/projects/118)
-GitHub Project.
+All MUST requirements now have automated tests. See [`test/README.md`](test/README.md) for how to run them and which test covers each requirement.
 
 ## Community, discussion, contribution, and support
 
