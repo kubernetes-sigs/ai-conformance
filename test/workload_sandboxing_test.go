@@ -87,7 +87,7 @@ func TestWorkloadSandboxing(t *testing.T) {
 	rc, err := resolveSandboxedRuntimeClass(ctx, clientset, *sandboxRuntimeClass, t.Logf)
 	if err != nil {
 		if errors.Is(err, errNoSandboxedRuntimeClass) {
-			t.Skipf("Skipping workload sandboxing test: %v. Specify -sandbox-runtime-class to run. Platforms where workload sandboxing is not supported may leave the flag unset to opt out.", err)
+			t.Skipf("Skipping workload sandboxing test: %v. Specify -sandbox-runtime-class to run.", err)
 		}
 		t.Fatalf("Failed to resolve sandboxed RuntimeClass: %v", err)
 	}
