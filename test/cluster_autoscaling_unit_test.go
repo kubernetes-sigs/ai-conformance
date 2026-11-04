@@ -332,6 +332,52 @@ func TestVerifyPoolIsIdle(t *testing.T) {
 		}
 	})
 
+	t.Run("ignores transient platform validation Pods", func(t *testing.T) {
+		client := fake.NewClientset(&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "nvidia-cuda-validator-66cwf", Namespace: "nvidia-gpu-operator"},
+			Spec: corev1.PodSpec{
+				NodeName:      "node-a",
+				RestartPolicy: corev1.RestartPolicyOnFailure,
+			},
+		})
+		if err := verifyPoolIsIdle(context.Background(), client, "test", poolNodes, "agentpool", "gpu", allocationModeDevicePlugin, cfg); err != nil {
+			t.Fatalf("verifyPoolIsIdle unexpected error: %v", err)
+		}
+	})
+
+	t.Run("rejects a batch Pod in a user namespace", func(t *testing.T) {
+		client := fake.NewClientset(&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "user-batch", Namespace: "other"},
+			Spec: corev1.PodSpec{
+				NodeName:      "node-a",
+				RestartPolicy: corev1.RestartPolicyNever,
+			},
+		})
+		if err := verifyPoolIsIdle(context.Background(), client, "test", poolNodes, "agentpool", "gpu", allocationModeDevicePlugin, cfg); err == nil {
+			t.Fatal("verifyPoolIsIdle expected foreign-workload error")
+		}
+	})
+
+	t.Run("rejects a platform Pod that requests an accelerator", func(t *testing.T) {
+		resourceName := corev1.ResourceName(cfg.ExtendedResource)
+		client := fake.NewClientset(&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "platform-gpu-job", Namespace: "nvidia-gpu-operator"},
+			Spec: corev1.PodSpec{
+				NodeName:      "node-a",
+				RestartPolicy: corev1.RestartPolicyOnFailure,
+				Containers: []corev1.Container{{
+					Name: "worker",
+					Resources: corev1.ResourceRequirements{
+						Limits: corev1.ResourceList{resourceName: resource.MustParse("1")},
+					},
+				}},
+			},
+		})
+		if err := verifyPoolIsIdle(context.Background(), client, "test", poolNodes, "agentpool", "gpu", allocationModeDevicePlugin, cfg); err == nil {
+			t.Fatal("verifyPoolIsIdle expected foreign-workload error")
+		}
+	})
+
 	t.Run("rejects a foreign scheduled Pod", func(t *testing.T) {
 		client := fake.NewClientset(&corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: "foreign", Namespace: "other"},
