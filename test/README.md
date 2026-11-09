@@ -10,6 +10,7 @@ To run these AI Conformance tests, you must have:
 - Driver & Runtime Test: `TestAcceleratorDriverRuntimeManagement` additionally pulls a vanilla container image (`ubuntu:22.04` by default; override with `-driver-runtime-image` for air-gapped registries) and expects the platform's container runtime configuration to inject the accelerator vendor's tools (`nvidia-smi` for NVIDIA) into accelerator workloads.
 - HPA Autoscaling Test: `TestHPAAutoscaling` additionally requires capacity to allocate `-hpa-max-replicas` accelerators (default 2, at least 2) to the test at the same time, one per Pod, plus 50m CPU and 64Mi memory per Pod, a custom metrics pipeline configured as described in [HPA Autoscaling for AI Workloads](#hpa-autoscaling-for-ai-workloads), and the ability to pull `docker.io/library/python:3.13-alpine` (or a mirror of it set with `-hpa-workload-image`).
 - GPU Sharing Test: `TestGPUSharing` requires either DRA support with a DeviceClass (e.g. `gpu.nvidia.com`) or nodes advertising fractional or shared GPU resources (time-slicing, MPS, or MIG profiles). The test is skipped automatically when neither is detected and no flags are set. The GPU node must have enough free capacity for `N` concurrent test Pods sharing one physical GPU: by default `N` equals physical GPUs + 1 (to force pigeonholing), or all allocatable units if the physical GPU count is unknown; override with `-gpu-sharing-pods`.
+- Gateway API Test: `TestGatewayAPIInference` needs no accelerator. It requires a `gateway.networking.k8s.io/v1` `GatewayClass` whose `Gateway` address is reachable from Pods, the ability to pull `docker.io/library/python:3.13-alpine`, and capacity for three small Pods (50m CPU and 64Mi memory each).
 - Network Access: The test machine must be able to reach the Kubernetes API server.
 
 ## Running the Tests
@@ -74,6 +75,18 @@ The test launches concurrent Pods, verifies that they reach Running simultaneous
 - `SharedResourceExposure`: Verifies that shared/fractional capacity is exposed on schedulable nodes.
 - `ConcurrentWorkloadsShareGPU`: Verifies that concurrent Pods actually share a physical GPU (for MIG, verifying each Pod gets a distinct partition of the same GPU).
 - `AcceleratorHealth`: Verifies that each Pod can successfully query and interact with its accelerator via vendor tooling (`nvidia-smi`).
+| Test Name | KAR | Manifest Key (`spec.<category>.<id>`) | Requirement Level |
+|---|---|---|---|
+| `TestAcceleratorDriverRuntimeManagement` | [KAR-0001](../kars/0001-accelerator-driver-runtime-management/README.md) | `spec.accelerators.driver_runtime_management` | MUST (v1.38+)<br>_SHOULD (v1.37)_ |
+| `TestGatewayAPIInference` | [KAR-0111](../kars/0111-gateway-api-inference/README.md) | `spec.networking.ai_inference` | MUST |
+| `TestGangScheduling` | [KAR-0053](../kars/0053-gang-scheduling/README.md) | `spec.schedulingOrchestration.gang_scheduling` | MUST |
+| `TestAcceleratorClusterAutoscaling` | [KAR-0055](../kars/0055-cluster-autoscaling-for-accelerators/README.md) | `spec.schedulingOrchestration.cluster_autoscaling` | MUST |
+| `TestHPAAutoscaling` | [KAR-0057](../kars/0057-hpa-autoscaling-for-ai-workloads/README.md) | `spec.schedulingOrchestration.pod_autoscaling` | MUST |
+| `TestAcceleratorPerformanceMetrics` | [KAR-0059](../kars/0059-accelerator-performance-metrics/README.md) | `spec.observability.accelerator_metrics` | MUST |
+| `TestAIServiceMetrics` | [KAR-0061](../kars/0061-ai-job-inference-service-metrics/README.md) | `spec.observability.ai_service_metrics` | MUST |
+| `TestSecureAcceleratorAccess` | [KAR-0049](../kars/0049-secure-accelerator-access/README.md) | `spec.security.secure_accelerator_access` | MUST |
+| `TestWorkloadSandboxing` | [KAR-0020](../kars/0020-workload-sandboxing/README.md) | `spec.security.workload_sandboxing` | MUST (v1.38+)<br>_SHOULD (v1.37)_ |
+| `TestRobustCRDControllerOperation` | [KAR-0063](../kars/0063-robust-crd-controller-operation/README.md) | `spec.operator.robust_controller` | MUST |
 
 ### Workload Sandboxing
 
@@ -86,7 +99,7 @@ go test -v ./test \
   -sandbox-runtime-class=gvisor
 ```
 
-If no sandboxed `RuntimeClass` is detected and none is specified, the test is skipped with guidance on configuring the flag or opting out if the capability is N/A.
+If no sandboxed `RuntimeClass` is detected and none is specified, the test is skipped with guidance on configuring the `-sandbox-runtime-class` flag.
 
 The test runs a probe script in the sandboxed pod and then runs the same script in an unsandboxed control pod pinned to the node the sandboxed pod landed on. The subtests verify observable isolation boundaries:
 - `ProcessIsolation`: Host processes (e.g., `kubelet`, `containerd`) are not visible and the PID namespace is strictly container-scoped.
@@ -146,6 +159,16 @@ Example with kube-prometheus-stack:
 go test -v ./test -run TestAIServiceMetrics -args \
   -service-metrics-prometheus-service=monitoring/prometheus-operated:9090 \
   -service-metrics-scrape-labels=release=kube-prometheus-stack
+```
+
+### Gateway API for AI Inference
+
+The Gateway API test (`TestGatewayAPIInference`, requirement `networking.ai_inference`) deploys two inference backends behind a `gateway.networking.k8s.io/v1` `Gateway` and `HTTPRoute`. The route sends requests with the header `OpenAI-Project: ai-conformance-canary` to the canary model version `model-v2` and splits all other requests 70/30 between `model-v1` and `model-v2`. After the `Gateway` is `Accepted` and `Programmed` with an address and the `HTTPRoute` is `Accepted` with `ResolvedRefs`, a probe Pod in the cluster sends traffic to the `Gateway` address. The test checks that all 20 header-matched requests reach `model-v2` in the first of up to ten batches without failed requests, and that 500 requests split within 5% of the weights in at least one of up to ten rounds, once three consecutive requests have been routed. The probe stops at the first round that passes. The weights, request count, tolerance and retries follow the upstream Gateway API v1.6.3 `HTTPRouteWeight` conformance test.
+
+By default the test uses the first `Accepted` `GatewayClass` by name and is skipped if the Gateway API is not served or no class is `Accepted`; it logs the chosen class and the other `Accepted` classes. Use `-gateway-api-class` to choose a class; the address must be reachable from Pods in the cluster. With a slow load balancer, raise both `-gateway-api-timeout` (default 10m) and `go test -timeout`. The test reserves 17 minutes of `-timeout` for Pods and cleanup, including up to 5 minutes each for the Gateway and the namespace to be deleted. If a wait shortened to fit runs out, it reports `ENVIRONMENT ERROR`. `run-e2e-gcp.sh` runs this test with agentgateway installed by `test/e2e/setup.d/50-agentgateway.sh`, which creates a `GatewayClass` whose Gateways get `ClusterIP` Services because kind has no load balancer.
+
+```bash
+go test -v ./test -run TestGatewayAPIInference -timeout 30m -args -gateway-api-class=<class>
 ```
 
 ### HPA Autoscaling for AI Workloads

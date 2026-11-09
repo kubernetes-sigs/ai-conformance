@@ -52,6 +52,6 @@ go test . -args -gateway-class <gatewayclass_name>
 
 ## Related KARs
 
-<!--
-List KARS that are related. This is in case of additional requirements that come up after a KAR has already graduated to “implemented”
--->
+- [KAR-0111: Gateway API for AI Inference](/kars/0111-gateway-api-inference/README.md)
+  (`networking.ai_inference`, `MUST`: core Kubernetes Gateway API traffic
+  management for inference services).

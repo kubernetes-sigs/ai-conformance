@@ -1,5 +1,6 @@
 # Kubernetes AI Conformance Checklist - v1.37
-# Notes: This checklist is based on the Kubernetes AI Conformance document.
+# Notes: This checklist is defined by the Kubernetes AI Conformance Requirements (KARs)
+# in https://github.com/kubernetes-sigs/ai-conformance/tree/main/kars.
 # Participants should fill in the 'status', 'evidence', and 'notes' fields for each requirement.
 #
 # Hybrid Verification Approach for v1.37:

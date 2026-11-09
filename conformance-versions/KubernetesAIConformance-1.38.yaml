@@ -1,9 +1,11 @@
 # Kubernetes AI Conformance Checklist - v1.38
-# Notes: This checklist is based on the Kubernetes AI Conformance document.
+# Notes: This checklist is defined by the Kubernetes AI Conformance Requirements (KARs)
+# in https://github.com/kubernetes-sigs/ai-conformance/tree/main/kars.
 # Participants should fill in the 'status', 'evidence', and 'notes' fields for each requirement.
 #
 # Hybrid Verification Approach for v1.38:
-# - For requirements with automated tests (e.g., Secure Accelerator Access, Gang Scheduling),
+# - For requirements with automated tests (all MUST requirements; see the "Test Cases Covered"
+#   table in https://github.com/kubernetes-sigs/ai-conformance/blob/main/test/README.md),
 #   you can link to the test output files (e.g., e2e.log, junit.xml) in the 'evidence' list.
 # - For requirements without automated tests, please provide manual evidence (e.g., documentation URLs,
 #   screenshots, or self-attestation logs).
