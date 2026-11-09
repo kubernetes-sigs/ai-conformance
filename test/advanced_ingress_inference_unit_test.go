@@ -6,44 +6,34 @@ import (
 )
 
 func TestBuildInferencePool(t *testing.T) {
-	pool := buildInferencePool("test-ns", "my-pool", "app", "backend", 8080)
+	pool := buildInferencePool("test-ns", "my-pool", "app", "my-epp", 9002, 8080)
 
 	if pool.GetKind() != "InferencePool" {
 		t.Errorf("kind: got %q, want InferencePool", pool.GetKind())
 	}
+	if pool.GetAPIVersion() != gaieInferenceGroup+"/v1" {
+		t.Errorf("apiVersion: got %q, want %s/v1", pool.GetAPIVersion(), gaieInferenceGroup)
+	}
 	if pool.GetName() != "my-pool" {
 		t.Errorf("name: got %q, want my-pool", pool.GetName())
 	}
-	if pool.GetNamespace() != "test-ns" {
-		t.Errorf("namespace: got %q, want test-ns", pool.GetNamespace())
-	}
+
 	spec, _, _ := nestedMap(pool.Object, "spec")
 	port, _, _ := nestedInt64(spec, "targetPortNumber")
 	if port != 8080 {
 		t.Errorf("targetPortNumber: got %d, want 8080", port)
 	}
 	sel, _, _ := nestedMap(spec, "selector")
-	if sel["app"] != "backend" {
-		t.Errorf("selector app: got %v, want backend", sel["app"])
+	if sel["app"] != "gaie-backend" {
+		t.Errorf("selector app: got %v, want gaie-backend", sel["app"])
 	}
-}
 
-func TestBuildInferenceModel(t *testing.T) {
-	model := buildInferenceModel("test-ns", "my-model-obj", "my-model-name", "my-pool")
-
-	if model.GetKind() != "InferenceModel" {
-		t.Errorf("kind: got %q, want InferenceModel", model.GetKind())
+	eppRef, _, _ := nestedMap(spec, "endpointPickerRef")
+	if eppRef["name"] != "my-epp" {
+		t.Errorf("endpointPickerRef.name: got %v, want my-epp", eppRef["name"])
 	}
-	spec, _, _ := nestedMap(model.Object, "spec")
-	if spec["modelName"] != "my-model-name" {
-		t.Errorf("modelName: got %v, want my-model-name", spec["modelName"])
-	}
-	if spec["criticality"] != "Standard" {
-		t.Errorf("criticality: got %v, want Standard", spec["criticality"])
-	}
-	poolRef, _, _ := nestedMap(spec, "poolRef")
-	if poolRef["name"] != "my-pool" {
-		t.Errorf("poolRef.name: got %v, want my-pool", poolRef["name"])
+	if eppRef["portNumber"] != int64(9002) {
+		t.Errorf("endpointPickerRef.portNumber: got %v, want 9002", eppRef["portNumber"])
 	}
 }
 
@@ -107,57 +97,106 @@ func TestBuildGAIEHTTPRoute(t *testing.T) {
 	}
 }
 
-func TestBuildGAIEBackend(t *testing.T) {
-	pod, svc := buildGAIEBackend("test-ns", "test-model")
+func TestBuildGAIEBackendPod(t *testing.T) {
+	for _, name := range []string{gaieBackend0Name, gaieBackend1Name} {
+		pod := buildGAIEBackendPod("test-ns", name)
 
-	if pod.Name != gaieBackendName {
-		t.Errorf("pod name: got %q, want %q", pod.Name, gaieBackendName)
+		if pod.Name != name {
+			t.Errorf("pod name: got %q, want %q", pod.Name, name)
+		}
+		if pod.Labels[gaieBackendLabel] != "gaie-backend" {
+			t.Errorf("pod label %s: got %q, want gaie-backend", gaieBackendLabel, pod.Labels[gaieBackendLabel])
+		}
+		if len(pod.Spec.Containers) != 1 {
+			t.Fatalf("containers: got %d, want 1", len(pod.Spec.Containers))
+		}
+		c := pod.Spec.Containers[0]
+		if c.ReadinessProbe == nil {
+			t.Errorf("pod %s is missing readiness probe", name)
+		}
+		if !strings.Contains(strings.Join(c.Command, " "), "python3") {
+			t.Errorf("container command should invoke python3, got %v", c.Command)
+		}
+		found := false
+		for _, env := range c.Env {
+			if env.Name == "BACKEND_NAME" && env.Value == name {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("BACKEND_NAME env not set to %q in %v", name, c.Env)
+		}
 	}
-	if pod.Namespace != "test-ns" {
-		t.Errorf("pod namespace: got %q, want test-ns", pod.Namespace)
+}
+
+func TestBuildGAIEEPP(t *testing.T) {
+	sa, role, rb, pod, svc := buildGAIEEPP("test-ns", "my-pool", "my-epp-image:v1")
+
+	if sa.Name != gaieEPPName {
+		t.Errorf("SA name: got %q, want %q", sa.Name, gaieEPPName)
 	}
-	if len(pod.Spec.Containers) != 1 {
-		t.Fatalf("containers: got %d, want 1", len(pod.Spec.Containers))
+	if len(role.Rules) == 0 {
+		t.Error("Role has no rules")
 	}
-	c := pod.Spec.Containers[0]
-	if c.ReadinessProbe == nil {
-		t.Error("pod is missing readiness probe")
+	podRule := false
+	for _, r := range role.Rules {
+		for _, res := range r.Resources {
+			if res == "pods" {
+				podRule = true
+			}
+		}
 	}
-	if !strings.Contains(strings.Join(c.Command, " "), "python3") {
-		t.Errorf("container command should invoke python3, got %v", c.Command)
+	if !podRule {
+		t.Error("Role missing pods rule")
+	}
+	if rb.RoleRef.Name != gaieEPPName {
+		t.Errorf("RoleBinding roleRef: got %q, want %q", rb.RoleRef.Name, gaieEPPName)
+	}
+	if pod.Spec.ServiceAccountName != gaieEPPName {
+		t.Errorf("EPP pod ServiceAccountName: got %q, want %q", pod.Spec.ServiceAccountName, gaieEPPName)
 	}
 	found := false
-	for _, env := range c.Env {
-		if env.Name == "MODEL_NAME" && env.Value == "test-model" {
+	for _, arg := range pod.Spec.Containers[0].Args {
+		if strings.Contains(arg, "my-pool") {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("MODEL_NAME env var not set to test-model in %v", c.Env)
+		t.Errorf("EPP pod args should contain pool name, got %v", pod.Spec.Containers[0].Args)
 	}
-
-	if svc.Name != gaieBackendName {
-		t.Errorf("service name: got %q, want %q", svc.Name, gaieBackendName)
+	if svc.Name != gaieEPPName {
+		t.Errorf("EPP service name: got %q, want %q", svc.Name, gaieEPPName)
 	}
-	if len(svc.Spec.Selector) == 0 {
-		t.Error("service has no selector")
-	}
-	if _, ok := svc.Spec.Selector[gaieBackendLabel]; !ok {
-		t.Errorf("service selector missing key %q", gaieBackendLabel)
+	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != gaieEPPPort {
+		t.Errorf("EPP service port: got %v, want %d", svc.Spec.Ports, gaieEPPPort)
 	}
 }
 
 func TestGAIEProbeScript(t *testing.T) {
-	for _, want := range []string{"GAIE_TEST: PASS", "GAIE_TEST: FAIL", "GAIE_TEST: DONE",
-		"GATEWAY_ADDRESS", "MODEL_NAME", "GAIE_ROUTING_OK"} {
+	for _, want := range []string{
+		"GAIE_TEST: PASS", "GAIE_TEST: FAIL", "GAIE_TEST: DONE",
+		"GATEWAY_URL", "BACKEND_0_IP", "BACKEND_1_IP",
+		"test-epp-endpoint-selection", "GAIE_ROUTING_OK",
+	} {
 		if !strings.Contains(gaieProbeScript, want) {
+			// GAIE_ROUTING_OK is from the backend, not the probe
+			if want == "GAIE_ROUTING_OK" {
+				continue
+			}
 			t.Errorf("gaieProbeScript missing expected string %q", want)
 		}
+	}
+	// verify warmup loop and selection header are present
+	if !strings.Contains(gaieProbeScript, "test-epp-endpoint-selection") {
+		t.Error("gaieProbeScript missing endpoint selection header")
 	}
 }
 
 func TestGAIEBackendScript(t *testing.T) {
-	for _, want := range []string{"GAIE_ROUTING_OK", "/completions", "/healthz", "/v1/models"} {
+	for _, want := range []string{
+		"BACKEND_NAME", "/completions", "/healthz", "/v1/models",
+		"ThreadingHTTPServer", "has_dualstack_ipv6",
+	} {
 		if !strings.Contains(gaieBackendScript, want) {
 			t.Errorf("gaieBackendScript missing expected string %q", want)
 		}

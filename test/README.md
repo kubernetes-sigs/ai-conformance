@@ -10,6 +10,7 @@ To run these AI Conformance tests, you must have:
 - Driver & Runtime Test: `TestAcceleratorDriverRuntimeManagement` additionally pulls a vanilla container image (`ubuntu:22.04` by default; override with `-driver-runtime-image` for air-gapped registries) and expects the platform's container runtime configuration to inject the accelerator vendor's tools (`nvidia-smi` for NVIDIA) into accelerator workloads.
 - HPA Autoscaling Test: `TestHPAAutoscaling` additionally requires capacity to allocate `-hpa-max-replicas` accelerators (default 2, at least 2) to the test at the same time, one per Pod, plus 50m CPU and 64Mi memory per Pod, a custom metrics pipeline configured as described in [HPA Autoscaling for AI Workloads](#hpa-autoscaling-for-ai-workloads), and the ability to pull `docker.io/library/python:3.13-alpine` (or a mirror of it set with `-hpa-workload-image`).
 - Gateway API Test: `TestGatewayAPIInference` needs no accelerator. It requires a `gateway.networking.k8s.io/v1` `GatewayClass` whose `Gateway` address is reachable from Pods, the ability to pull `docker.io/library/python:3.13-alpine`, and capacity for three small Pods (50m CPU and 64Mi memory each).
+- Advanced Inference Ingress Test: `TestAdvancedInferenceIngress` needs no accelerator. It requires a GatewayClass that supports the Gateway API Inference Extension (GAIE) — set via `-gaie-gateway-class` — with both `inference.networking.x-k8s.io/v1` and `gateway.networking.k8s.io/v1` CRDs installed. The test deploys two inference backend Pods and a lightweight endpoint picker (`registry.k8s.io/gateway-api-inference-extension/lwepp:v1.6.2` by default; override with `-gaie-epp-image`) to verify that the EPP routes requests to the correct backend Pod. It is **skipped by default** when `-gaie-gateway-class` is not set. Platforms that do not support GAIE may leave the flag unset to opt out.
 - Network Access: The test machine must be able to reach the Kubernetes API server.
 
 ## Running the Tests
@@ -37,6 +38,7 @@ go test -v -short ./test
 |---|---|---|---|
 | `TestAcceleratorDriverRuntimeManagement` | [KAR-0001](../kars/0001-accelerator-driver-runtime-management/README.md) | `spec.accelerators.driver_runtime_management` | MUST (v1.38+)<br>_SHOULD (v1.37)_ |
 | `TestGatewayAPIInference` | [KAR-0111](../kars/0111-gateway-api-inference/README.md) | `spec.networking.ai_inference` | MUST |
+| `TestAdvancedInferenceIngress` | [KAR-0011](../kars/0011-advanced-ingress-inference/README.md) | `spec.networking.advanced_inference_ingress` | SHOULD |
 | `TestGangScheduling` | [KAR-0053](../kars/0053-gang-scheduling/README.md) | `spec.schedulingOrchestration.gang_scheduling` | MUST |
 | `TestAcceleratorClusterAutoscaling` | [KAR-0055](../kars/0055-cluster-autoscaling-for-accelerators/README.md) | `spec.schedulingOrchestration.cluster_autoscaling` | MUST |
 | `TestHPAAutoscaling` | [KAR-0057](../kars/0057-hpa-autoscaling-for-ai-workloads/README.md) | `spec.schedulingOrchestration.pod_autoscaling` | MUST |
