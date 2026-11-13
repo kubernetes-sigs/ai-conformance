@@ -377,12 +377,22 @@ gotestsum \
 REMOTE_TEST
 
 # Copy test artifacts back to host. This also runs after a test failure so
-# that results.json and junit_01.xml reach Prow and TestGrid.
-gcloud compute scp --project="${GCP_PROJECT}" --zone="${GCE_ZONE}" --recurse "${VM_NAME}:~/ai-conformance/_artifacts/*" "${ARTIFACTS}/" || true
+# that results.json and junit_01.xml reach Prow and TestGrid. A copy failure
+# must not hide the test status, so record it and report it below.
+COPY_EXIT_CODE=0
+gcloud compute scp --project="${GCP_PROJECT}" --zone="${GCE_ZONE}" --recurse "${VM_NAME}:~/ai-conformance/_artifacts/*" "${ARTIFACTS}/" || COPY_EXIT_CODE=$?
+if [[ "${COPY_EXIT_CODE}" -ne 0 ]]; then
+    echo "ERROR: failed to copy test artifacts from the VM (exit code ${COPY_EXIT_CODE})." >&2
+fi
 
 if [[ "${TEST_EXIT_CODE}" -ne 0 ]]; then
     echo "AI Conformance E2E tests failed (exit code ${TEST_EXIT_CODE})."
     exit "${TEST_EXIT_CODE}"
+fi
+
+# The tests passed, but Prow and TestGrid have no results without the artifacts.
+if [[ "${COPY_EXIT_CODE}" -ne 0 ]]; then
+    exit "${COPY_EXIT_CODE}"
 fi
 
 echo "================================================================"
