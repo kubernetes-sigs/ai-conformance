@@ -337,7 +337,8 @@ REMOTE_STACK
 echo "================================================================"
 echo "4. Executing AI Conformance Test Suite (test/)"
 echo "================================================================"
-gcloud compute ssh "${VM_NAME}" --project="${GCP_PROJECT}" --zone="${GCE_ZONE}" --command="bash -s" <<REMOTE_TEST
+TEST_EXIT_CODE=0
+gcloud compute ssh "${VM_NAME}" --project="${GCP_PROJECT}" --zone="${GCE_ZONE}" --command="bash -s" <<REMOTE_TEST || TEST_EXIT_CODE=$?
 set -euo pipefail
 export PATH="/usr/local/go/bin:\${HOME}/go/bin:\${PATH}"
 
@@ -356,16 +357,43 @@ trap 'status=\$?; if [ "\$status" -ne 0 ]; then
   kubectl get events -A --sort-by=.lastTimestamp | tail -80 || true
 fi' EXIT
 
+echo "Installing gotestsum..."
+go install gotest.tools/gotestsum@v1.13.0
+
+# gotestsum keeps the go test -json stream in results.json and also writes
+# junit_01.xml. TestGrid only shows one row per test when a junit*.xml file
+# is present in the artifacts directory.
 echo "Running go test ./test/..."
-go test -v -timeout 40m ./test/... \
+gotestsum \
+    --format standard-verbose \
+    --jsonfile _artifacts/results.json \
+    --junitfile _artifacts/junit_01.xml \
+    --junitfile-testsuite-name short \
+    --junitfile-testcase-classname short \
+    -- -timeout 40m ./test/... \
     -accelerator-type=nvidia \
     -allocation-mode=auto \
-    "\${SETUP_ARGS[@]}" \
-    -json | tee _artifacts/results.json
+    "\${SETUP_ARGS[@]}"
 REMOTE_TEST
 
-# Copy test artifacts back to host
-gcloud compute scp --project="${GCP_PROJECT}" --zone="${GCE_ZONE}" --recurse "${VM_NAME}:~/ai-conformance/_artifacts/*" "${ARTIFACTS}/"
+# Copy test artifacts back to host. This also runs after a test failure so
+# that results.json and junit_01.xml reach Prow and TestGrid. A copy failure
+# must not hide the test status, so record it and report it below.
+COPY_EXIT_CODE=0
+gcloud compute scp --project="${GCP_PROJECT}" --zone="${GCE_ZONE}" --recurse "${VM_NAME}:~/ai-conformance/_artifacts/*" "${ARTIFACTS}/" || COPY_EXIT_CODE=$?
+if [[ "${COPY_EXIT_CODE}" -ne 0 ]]; then
+    echo "ERROR: failed to copy test artifacts from the VM (exit code ${COPY_EXIT_CODE})." >&2
+fi
+
+if [[ "${TEST_EXIT_CODE}" -ne 0 ]]; then
+    echo "AI Conformance E2E tests failed (exit code ${TEST_EXIT_CODE})."
+    exit "${TEST_EXIT_CODE}"
+fi
+
+# The tests passed, but Prow and TestGrid have no results without the artifacts.
+if [[ "${COPY_EXIT_CODE}" -ne 0 ]]; then
+    exit "${COPY_EXIT_CODE}"
+fi
 
 echo "================================================================"
 echo "AI Conformance E2E Test Run Completed Successfully!"
