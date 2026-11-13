@@ -36,15 +36,21 @@ GAIE's [official conformance suite](https://github.com/kubernetes-sigs/gateway-a
 
 ### Automated Tests
 
-The test will be written in go, and the logic looks like the following:
+`TestAdvancedInferenceIngress` in `test/advanced_ingress_inference_test.go` implements the automated conformance check. It:
+
+1. Deploys two mock inference backend Pods each returning their own name in every OpenAI-compatible chat-completions response.
+2. Deploys the GAIE lightweight endpoint picker (`lwepp`) wired to the InferencePool via `spec.endpointPickerRef`.
+3. Creates a `Gateway`, `InferencePool` (v1), and `HTTPRoute` and waits for them to reach `Accepted`/`Programmed` conditions.
+4. Sends inference requests carrying the `test-epp-endpoint-selection: <podIP>` header through the Gateway and verifies that each request reaches the designated backend Pod, exercising the endpoint-picker routing contract.
+
+The test is **skipped by default**. Run it with:
 
 ```bash
-# Run GAIE official conformance suite
-git clone https://github.com/kubernetes-sigs/gateway-api-inference-extension.git  
-cd gateway-api-inference-extension/conformance
-kubectl get gatewayclass # get the gatewayclass name
-go test . -args -gateway-class <gatewayclass_name>
+go test -v ./test -run TestAdvancedInferenceIngress -args \
+  -gaie-gateway-class=<gatewayclass-name>
 ```
+
+Additional flags: `-gaie-epp-image` (default `registry.k8s.io/gateway-api-inference-extension/lwepp:v1.6.2`), `-gaie-timeout` (default `5m`).
 
 ## Implementation History
 
