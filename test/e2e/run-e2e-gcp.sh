@@ -172,7 +172,8 @@ echo "Installing Docker & NVIDIA Container Toolkit..."
 sudo apt-get update -qq
 sudo apt-get install -y -qq ca-certificates curl gnupg make build-essential git jq docker.io zstd
 
-if ! command -v nvidia-ctk >/dev/null 2>&1; then
+# disable-ipc-discoverer (set below) needs NVIDIA Container Toolkit >= 1.20.0.
+if ! dpkg --compare-versions "\$(dpkg-query -W -f='\${Version}' nvidia-container-toolkit 2>/dev/null || true)" ge 1.20.0; then
   curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey |
     sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
   curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list |
@@ -181,11 +182,24 @@ if ! command -v nvidia-ctk >/dev/null 2>&1; then
   sudo apt-get update -qq
   sudo apt-get install -y -qq nvidia-container-toolkit
 fi
+toolkit_version=\$(dpkg-query -W -f='\${Version}' nvidia-container-toolkit)
+echo "NVIDIA Container Toolkit \${toolkit_version}"
+if ! dpkg --compare-versions "\${toolkit_version}" ge 1.20.0; then
+  echo "ERROR: NVIDIA Container Toolkit \${toolkit_version} is older than 1.20.0" >&2
+  exit 1
+fi
 
 sudo usermod -aG docker \$USER
 
 sudo nvidia-ctk runtime configure --runtime=docker --set-as-default --cdi.enabled
 sudo nvidia-ctk config --set accept-nvidia-visible-devices-as-volume-mounts=true --in-place
+# Keep the host's /run/nvidia-persistenced/socket out of GPU containers, and so
+# out of the nvkind worker. If nvidia-persistenced replaces that socket, the
+# worker's bind mount goes stale and the DRA driver's CDI specs still mount it,
+# so every later GPU pod fails to start (#118).
+sudo nvidia-ctk config --set nvidia-container-runtime.modes.jit-cdi.nvcdi-feature-flags=disable-ipc-discoverer --in-place
+# The flag only applies in jit-cdi mode; the runtime log records the mode used.
+sudo nvidia-ctk config --set nvidia-container-runtime.debug=/var/log/nvidia-container-runtime.log --in-place
 sudo systemctl restart docker
 
 echo "Verifying host GPU driver..."
@@ -198,6 +212,24 @@ sudo docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all ubuntu:22.04
 # Fail early if GPUs are missing before the Kubernetes/DRA tests begin.
 echo "Verifying nvkind-style GPU injection into Docker..."
 sudo docker run --rm -v /dev/null:/var/run/nvidia-container-devices/all ubuntu:22.04 nvidia-smi -L
+
+echo "Verifying nvkind-style containers do not get the nvidia-persistenced socket..."
+if ! sudo nvidia-ctk config | awk '/^\[/ { s = (\$0 == "[nvidia-container-runtime.modes.jit-cdi]") }
+    s && /^nvcdi-feature-flags = .*"disable-ipc-discoverer"/ { f = 1 } END { exit !f }'; then
+  echo "ERROR: disable-ipc-discoverer is not set for the NVIDIA runtime's jit-cdi mode" >&2
+  exit 1
+fi
+if ! sudo test -S /run/nvidia-persistenced/socket; then
+  echo "NOTE: no nvidia-persistenced socket on the host; relying on the config and mode checks"
+fi
+sudo truncate -s 0 /var/log/nvidia-container-runtime.log
+sudo docker run --rm -v /dev/null:/var/run/nvidia-container-devices/all ubuntu:22.04 \
+  sh -c 'nvidia-smi -L >/dev/null && test ! -e /run/nvidia-persistenced/socket'
+if ! sudo grep -qE "mode (as )?'jit-cdi'" /var/log/nvidia-container-runtime.log; then
+  echo "ERROR: the NVIDIA runtime did not use jit-cdi mode, so disable-ipc-discoverer does not apply" >&2
+  sudo cat /var/log/nvidia-container-runtime.log >&2 || true
+  exit 1
+fi
 
 echo "Installing Helm..."
 curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
@@ -302,6 +334,8 @@ if [[ -z "\${kind_uuids}" || "\${host_uuids}" != "\${kind_uuids}" ]]; then
   echo "nvkind:   \${kind_uuids}" >&2
   exit 1
 fi
+echo "Verifying the nvkind worker has no nvidia-persistenced socket..."
+sudo docker exec ai-conformance-cluster-worker test ! -e /run/nvidia-persistenced/socket
 kubectl get nodes -o wide
 REMOTE_SCRIPT
 
@@ -355,6 +389,16 @@ trap 'status=\$?; if [ "\$status" -ne 0 ]; then
   kubectl get resourceclaims -A -o yaml || true
   kubectl get pods -n nvidia-dra-driver -o wide || true
   kubectl get events -A --sort-by=.lastTimestamp | tail -80 || true
+  # Host and worker state of the nvidia-persistenced socket. The worker should
+  # not have it at all; a stale copy there breaks GPU pod mounts (#118).
+  echo "--- nvidia-persistenced on the GCE host ---"
+  sudo systemctl status nvidia-persistenced --no-pager || true
+  sudo journalctl -u nvidia-persistenced --no-pager -n 50 || true
+  ls -l /run/nvidia-persistenced || true
+  stat -c "%i %z %n" /run/nvidia-persistenced/socket || true
+  echo "--- nvidia-persistenced in the nvkind worker ---"
+  sudo docker exec ai-conformance-cluster-worker ls -l /run/nvidia-persistenced || true
+  sudo docker exec ai-conformance-cluster-worker stat -c "%i %z %n" /run/nvidia-persistenced/socket || true
 fi' EXIT
 
 echo "Installing gotestsum..."
