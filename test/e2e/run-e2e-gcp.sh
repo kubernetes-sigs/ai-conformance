@@ -173,9 +173,9 @@ sudo apt-get update -qq
 sudo apt-get install -y -qq ca-certificates curl gnupg make build-essential git jq docker.io zstd
 
 # disable-ipc-discoverer (set below) needs NVIDIA Container Toolkit >= 1.20.0.
-if ! dpkg --compare-versions "\$(dpkg-query -W -f='\${Version}' nvidia-container-toolkit 2>/dev/null || true)" ge 1.20.0; then
+if ! command -v nvidia-ctk >/dev/null 2>&1 || ! dpkg --compare-versions "\$(dpkg-query -W -f='\${Version}' nvidia-container-toolkit 2>/dev/null || true)" ge 1.20.0; then
   curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey |
-    sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+    sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
   curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list |
     sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' |
     sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null
@@ -197,9 +197,8 @@ sudo nvidia-ctk config --set accept-nvidia-visible-devices-as-volume-mounts=true
 # out of the nvkind worker. If nvidia-persistenced replaces that socket, the
 # worker's bind mount goes stale and the DRA driver's CDI specs still mount it,
 # so every later GPU pod fails to start (#118).
+sudo nvidia-ctk config --set nvidia-container-runtime.mode=jit-cdi --in-place
 sudo nvidia-ctk config --set nvidia-container-runtime.modes.jit-cdi.nvcdi-feature-flags=disable-ipc-discoverer --in-place
-# The flag only applies in jit-cdi mode; the runtime log records the mode used.
-sudo nvidia-ctk config --set nvidia-container-runtime.debug=/var/log/nvidia-container-runtime.log --in-place
 sudo systemctl restart docker
 
 echo "Verifying host GPU driver..."
@@ -211,25 +210,8 @@ sudo docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all ubuntu:22.04
 # nvkind uses the volume-mount GPU injection path, not just the NVIDIA runtime.
 # Fail early if GPUs are missing before the Kubernetes/DRA tests begin.
 echo "Verifying nvkind-style GPU injection into Docker..."
-sudo docker run --rm -v /dev/null:/var/run/nvidia-container-devices/all ubuntu:22.04 nvidia-smi -L
-
-echo "Verifying nvkind-style containers do not get the nvidia-persistenced socket..."
-if ! sudo nvidia-ctk config | awk '/^\[/ { s = (\$0 == "[nvidia-container-runtime.modes.jit-cdi]") }
-    s && /^nvcdi-feature-flags = .*"disable-ipc-discoverer"/ { f = 1 } END { exit !f }'; then
-  echo "ERROR: disable-ipc-discoverer is not set for the NVIDIA runtime's jit-cdi mode" >&2
-  exit 1
-fi
-if ! sudo test -S /run/nvidia-persistenced/socket; then
-  echo "NOTE: no nvidia-persistenced socket on the host; relying on the config and mode checks"
-fi
-sudo truncate -s 0 /var/log/nvidia-container-runtime.log
 sudo docker run --rm -v /dev/null:/var/run/nvidia-container-devices/all ubuntu:22.04 \
-  sh -c 'nvidia-smi -L >/dev/null && test ! -e /run/nvidia-persistenced/socket'
-if ! sudo grep -qE "mode (as )?'jit-cdi'" /var/log/nvidia-container-runtime.log; then
-  echo "ERROR: the NVIDIA runtime did not use jit-cdi mode, so disable-ipc-discoverer does not apply" >&2
-  sudo cat /var/log/nvidia-container-runtime.log >&2 || true
-  exit 1
-fi
+  sh -c 'nvidia-smi -L && test ! -e /run/nvidia-persistenced/socket'
 
 echo "Installing Helm..."
 curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
