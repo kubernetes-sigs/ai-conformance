@@ -19,21 +19,27 @@ func TestBuildInferencePool(t *testing.T) {
 	}
 
 	spec, _, _ := nestedMap(pool.Object, "spec")
-	port, _, _ := nestedInt64(spec, "targetPortNumber")
-	if port != 8080 {
-		t.Errorf("targetPortNumber: got %d, want 8080", port)
+	targetPorts, ok := spec["targetPorts"].([]any)
+	if !ok || len(targetPorts) != 1 {
+		t.Fatalf("targetPorts: got %v", spec["targetPorts"])
+	}
+	tp, _ := targetPorts[0].(map[string]any)
+	if tp["number"] != int64(8080) {
+		t.Errorf("targetPorts[0].number: got %v, want 8080", tp["number"])
 	}
 	sel, _, _ := nestedMap(spec, "selector")
-	if sel["app"] != "gaie-backend" {
-		t.Errorf("selector app: got %v, want gaie-backend", sel["app"])
+	matchLabels, _, _ := nestedMap(sel, "matchLabels")
+	if matchLabels["app"] != "gaie-backend" {
+		t.Errorf("selector.matchLabels app: got %v, want gaie-backend", matchLabels["app"])
 	}
 
 	eppRef, _, _ := nestedMap(spec, "endpointPickerRef")
 	if eppRef["name"] != "my-epp" {
 		t.Errorf("endpointPickerRef.name: got %v, want my-epp", eppRef["name"])
 	}
-	if eppRef["portNumber"] != int64(9002) {
-		t.Errorf("endpointPickerRef.portNumber: got %v, want 9002", eppRef["portNumber"])
+	eppPort, _, _ := nestedMap(eppRef, "port")
+	if eppPort["number"] != int64(9002) {
+		t.Errorf("endpointPickerRef.port.number: got %v, want 9002", eppPort["number"])
 	}
 }
 

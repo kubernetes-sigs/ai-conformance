@@ -40,7 +40,7 @@ const (
 	gaieDeleteTimeout   = 5 * time.Minute
 	gaieDefaultEPPImage = "registry.k8s.io/gateway-api-inference-extension/lwepp:v1.6.2"
 
-	gaieInferenceGroup = "inference.networking.x-k8s.io"
+	gaieInferenceGroup = "inference.networking.k8s.io"
 	gaieGatewayGroup   = "gateway.networking.k8s.io"
 )
 
@@ -152,18 +152,26 @@ else:
     print("GAIE_TEST: ERROR: gateway not reachable after warmup", flush=True)
     sys.exit(1)
 
+REQUESTS_PER_TARGET = 5
+
 def verify(ip, expected, label):
-    for i in range(10):
-        try:
-            got = call(ip)
-            if got == expected:
-                print("GAIE_TEST: %s reached %s" % (label, expected), flush=True)
-                return True
-            print("attempt %d: %s got %s, want %s" % (i, label, got, expected), flush=True)
-        except Exception as e:
-            print("attempt %d: %s error: %s" % (i, label, e), flush=True)
-        time.sleep(5)
-    return False
+    for req_i in range(REQUESTS_PER_TARGET):
+        got = None
+        for retry in range(10):
+            try:
+                got = call(ip)
+                break
+            except Exception as e:
+                print("req %d retry %d: %s error: %s" % (req_i, retry, label, e), flush=True)
+                time.sleep(2)
+        if got is None:
+            print("GAIE_TEST: FAIL: %s request %d failed after all retries" % (label, req_i), flush=True)
+            return False
+        if got != expected:
+            print("GAIE_TEST: FAIL: %s request %d got %s, want %s" % (label, req_i, got, expected), flush=True)
+            return False
+    print("GAIE_TEST: %s all %d requests reached %s" % (label, REQUESTS_PER_TARGET, expected), flush=True)
+    return True
 
 ok0 = verify(IP_0, BACKEND_0, "selection-to-backend-0")
 ok1 = verify(IP_1, BACKEND_1, "selection-to-backend-1")
@@ -279,7 +287,7 @@ func TestAdvancedInferenceIngress(t *testing.T) {
 		if err != nil {
 			t.Fatalf("FAIL: %v", err)
 		}
-		if err := waitForInferencePoolAccepted(ctx, dyn, namespace, gaiePoolName, *gaieTimeout); err != nil {
+		if err := waitForInferencePoolAccepted(ctx, dyn, namespace, gaiePoolName, gaieGatewayName, *gaieTimeout); err != nil {
 			t.Fatalf("FAIL: %v", err)
 		}
 		if err := waitForGAIEHTTPRouteAccepted(ctx, dyn, namespace, gaieRouteName, gaieGatewayName, *gaieTimeout); err != nil {
@@ -393,7 +401,7 @@ func buildGAIEEPP(ns, poolName, image string) (*corev1.ServiceAccount, *rbacv1.R
 			Containers: []corev1.Container{{
 				Name:  "epp",
 				Image: image,
-				Args:  []string{"-poolName=" + poolName, "-poolNamespace=" + ns},
+				Args:  []string{"--pool-name=" + poolName, "--pool-namespace=" + ns},
 				Ports: []corev1.ContainerPort{{Name: "grpc", ContainerPort: gaieEPPPort}},
 				Resources: corev1.ResourceRequirements{
 					Requests: corev1.ResourceList{
@@ -427,11 +435,11 @@ func buildInferencePool(ns, name, labelKey, eppName string, eppPort, targetPort 
 		"kind":       "InferencePool",
 		"metadata":   map[string]any{"name": name, "namespace": ns},
 		"spec": map[string]any{
-			"targetPortNumber": int64(targetPort),
-			"selector":         map[string]any{labelKey: "gaie-backend"},
+			"targetPorts": []any{map[string]any{"number": int64(targetPort)}},
+			"selector":    map[string]any{"matchLabels": map[string]any{labelKey: "gaie-backend"}},
 			"endpointPickerRef": map[string]any{
-				"name":       eppName,
-				"portNumber": int64(eppPort),
+				"name": eppName,
+				"port": map[string]any{"number": int64(eppPort)},
 			},
 		},
 	}}
@@ -500,14 +508,30 @@ func waitForGAIEGatewayProgrammed(ctx context.Context, dyn dynamic.Interface, ns
 	return addr, nil
 }
 
-// waitForInferencePoolAccepted polls until the InferencePool has Accepted=True.
-func waitForInferencePoolAccepted(ctx context.Context, dyn dynamic.Interface, ns, name string, timeout time.Duration) error {
+// waitForInferencePoolAccepted polls until the InferencePool has Accepted=True
+// in the status.parents entry for gwName. In GAIE v1, InferencePool conditions
+// are reported per parent Gateway under status.parents[].conditions, not at
+// the top-level status.conditions.
+func waitForInferencePoolAccepted(ctx context.Context, dyn dynamic.Interface, ns, name, gwName string, timeout time.Duration) error {
 	pool, err := pollGatewayAPIObject(ctx, dyn, inferencePoolGVR, ns, name, timeout, func(o *unstructured.Unstructured) bool {
-		return conditionTrue(o.Object, "Accepted", "status", "conditions")
+		parents, _, _ := unstructured.NestedSlice(o.Object, "status", "parents")
+		for _, p := range parents {
+			m, ok := p.(map[string]any)
+			if !ok {
+				continue
+			}
+			if pName, _, _ := unstructured.NestedString(m, "parentRef", "name"); pName != gwName {
+				continue
+			}
+			if conditionTrue(m, "Accepted", "conditions") {
+				return true
+			}
+		}
+		return false
 	})
 	if err != nil {
-		return fmt.Errorf("InferencePool %s/%s was not Accepted within %v: %w; status: %s",
-			ns, name, timeout.Round(time.Second), err, statusJSON(pool))
+		return fmt.Errorf("InferencePool %s/%s was not Accepted by Gateway %s within %v: %w; status: %s",
+			ns, name, gwName, timeout.Round(time.Second), err, statusJSON(pool))
 	}
 	return nil
 }
