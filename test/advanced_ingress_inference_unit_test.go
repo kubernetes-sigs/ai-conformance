@@ -176,6 +176,15 @@ func TestBuildGAIEEPP(t *testing.T) {
 	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != gaieEPPPort {
 		t.Errorf("EPP service port: got %v, want %d", svc.Spec.Ports, gaieEPPPort)
 	}
+	if svc.Spec.Ports[0].AppProtocol == nil || *svc.Spec.Ports[0].AppProtocol != "h2c" {
+		t.Errorf("EPP service AppProtocol: got %v, want h2c", svc.Spec.Ports[0].AppProtocol)
+	}
+	epp := pod.Spec.Containers[0]
+	if epp.ReadinessProbe == nil || epp.ReadinessProbe.GRPC == nil {
+		t.Error("EPP pod missing gRPC readiness probe")
+	} else if epp.ReadinessProbe.GRPC.Port != gaieEPPHealthPort {
+		t.Errorf("EPP pod readiness probe port: got %d, want %d", epp.ReadinessProbe.GRPC.Port, gaieEPPHealthPort)
+	}
 }
 
 func TestGAIEProbeScript(t *testing.T) {
@@ -219,12 +228,3 @@ func nestedMap(obj map[string]any, key string) (map[string]any, bool, error) {
 	return m, ok, nil
 }
 
-// nestedInt64 extracts an int64 from a map by key.
-func nestedInt64(obj map[string]any, key string) (int64, bool, error) {
-	v, ok := obj[key]
-	if !ok {
-		return 0, false, nil
-	}
-	i, ok := v.(int64)
-	return i, ok, nil
-}

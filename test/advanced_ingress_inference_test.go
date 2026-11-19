@@ -37,7 +37,9 @@ const (
 	gaieRouteName       = "gaie-test-route"
 	gaieProberName      = "gaie-route-prober"
 	gaieRouteOKMarker   = "GAIE_TEST: PASS"
+	gaieEPPHealthPort   = int32(9003)
 	gaieDeleteTimeout   = 5 * time.Minute
+	gaieCleanupReserve  = 2*gaieDeleteTimeout + time.Minute
 	gaieDefaultEPPImage = "registry.k8s.io/gateway-api-inference-extension/lwepp:v1.6.2"
 
 	gaieInferenceGroup = "inference.networking.k8s.io"
@@ -65,8 +67,10 @@ func init() {
 			"The test is skipped when unset. Platforms that do not support GAIE may leave it unset to opt out.")
 	gaieEPPImage = flag.String("gaie-epp-image", gaieDefaultEPPImage,
 		"Container image for the lightweight Endpoint Picker (EPP) used to verify endpoint-picker routing.")
-	gaieTimeout = flag.Duration("gaie-timeout", 5*time.Minute,
-		"Timeout for Gateway provisioning and inference request routing.")
+	gaieTimeout = flag.Duration("gaie-timeout", 10*time.Minute,
+		"Timeout for Gateway provisioning and inference request routing. "+
+			"Raise both this and go test -timeout when provisioning is slow. "+
+			"The test reserves an additional 11m for cleanup.")
 }
 
 // gaieBackendScript is an OpenAI-compatible HTTP stub.
@@ -214,6 +218,29 @@ func TestAdvancedInferenceIngress(t *testing.T) {
 	}
 	t.Logf("GAIE CRDs verified: %s/v1 and %s/v1 APIs are available", gaieInferenceGroup, gaieGatewayGroup)
 
+	// Validate that the GatewayClass exists and is Accepted before spending time
+	// creating resources.
+	class, _, err := selectGatewayClass(ctx, dyn, *gaieGatewayClass)
+	if err != nil {
+		t.Fatalf("ENVIRONMENT ERROR: %v", err)
+	}
+	t.Logf("Using GatewayClass %s", class)
+
+	// Reserve gaieCleanupReserve for Gateway deletion and namespace termination so
+	// cleanup still finishes before the go test -timeout.
+	budget := *gaieTimeout
+	d, hasDeadline := t.Deadline()
+	if hasDeadline {
+		var budgetErr error
+		if budget, budgetErr = gatewayAPIBudget(budget, time.Until(d), gaieCleanupReserve); budgetErr != nil {
+			t.Fatalf("ENVIRONMENT ERROR: %v", budgetErr)
+		}
+		if budget < *gaieTimeout {
+			t.Logf("Capping -gaie-timeout at %v to finish within the go test -timeout", budget)
+		}
+	}
+	deadline := time.Now().Add(budget)
+
 	namespace := randomNamespaceName("gaie-conformance")
 	if _, err := clientset.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
 		t.Fatalf("Failed to create namespace %s: %v", namespace, err)
@@ -257,7 +284,7 @@ func TestAdvancedInferenceIngress(t *testing.T) {
 	if _, err := dyn.Resource(inferencePoolGVR).Namespace(namespace).Create(ctx, pool, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("Failed to create InferencePool: %v", err)
 	}
-	gw := buildGAIEGateway(namespace, gaieGatewayName, *gaieGatewayClass, gaieListenerPort)
+	gw := buildGAIEGateway(namespace, gaieGatewayName, class, gaieListenerPort)
 	if _, err := dyn.Resource(gaieGatewayGVR).Namespace(namespace).Create(ctx, gw, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("Failed to create Gateway: %v", err)
 	}
@@ -268,9 +295,14 @@ func TestAdvancedInferenceIngress(t *testing.T) {
 
 	// Wait for both backends and the EPP to reach Running before proceeding.
 	backends, err := waitForPodsRunning(ctx, clientset, namespace,
-		[]string{gaieBackend0Name, gaieBackend1Name, gaieEPPName}, *gaieTimeout)
+		[]string{gaieBackend0Name, gaieBackend1Name, gaieEPPName}, time.Until(deadline))
 	if err != nil {
-		t.Fatalf("ENVIRONMENT ERROR: inference or EPP pods did not start: %v", err)
+		t.Fatalf("ENVIRONMENT ERROR: inference or EPP pods did not start: %v\n  %s=%s\n  %s=%s\n  %s=%s",
+			err,
+			gaieBackend0Name, containerStatusJSON(ctx, clientset, namespace, gaieBackend0Name, "server"),
+			gaieBackend1Name, containerStatusJSON(ctx, clientset, namespace, gaieBackend1Name, "server"),
+			gaieEPPName, containerStatusJSON(ctx, clientset, namespace, gaieEPPName, "epp"),
+		)
 	}
 	backend0IP := backends[gaieBackend0Name].Status.PodIP
 	backend1IP := backends[gaieBackend1Name].Status.PodIP
@@ -283,14 +315,14 @@ func TestAdvancedInferenceIngress(t *testing.T) {
 
 	var gatewayAddress string
 	t.Run("GatewayReadiness", func(t *testing.T) {
-		addr, err := waitForGAIEGatewayProgrammed(ctx, dyn, namespace, gaieGatewayName, *gaieGatewayClass, *gaieTimeout)
+		addr, err := waitForGAIEGatewayProgrammed(ctx, dyn, namespace, gaieGatewayName, class, time.Until(deadline))
 		if err != nil {
 			t.Fatalf("FAIL: %v", err)
 		}
-		if err := waitForInferencePoolAccepted(ctx, dyn, namespace, gaiePoolName, gaieGatewayName, *gaieTimeout); err != nil {
+		if err := waitForInferencePoolAccepted(ctx, dyn, namespace, gaiePoolName, gaieGatewayName, time.Until(deadline)); err != nil {
 			t.Fatalf("FAIL: %v", err)
 		}
-		if err := waitForGAIEHTTPRouteAccepted(ctx, dyn, namespace, gaieRouteName, gaieGatewayName, *gaieTimeout); err != nil {
+		if err := waitForGAIEHTTPRouteAccepted(ctx, dyn, namespace, gaieRouteName, gaieGatewayName, time.Until(deadline)); err != nil {
 			t.Fatalf("FAIL: %v", err)
 		}
 		gatewayAddress = addr
@@ -303,7 +335,7 @@ func TestAdvancedInferenceIngress(t *testing.T) {
 	t.Run("EndpointPickerRouting", func(t *testing.T) {
 		gwURL := fmt.Sprintf("http://%s/v1/chat/completions",
 			net.JoinHostPort(gatewayAddress, strconv.Itoa(gaieListenerPort)))
-		logs, err := runGAIEProbe(ctx, t, clientset, namespace, gwURL, backend0IP, backend1IP, *gaieTimeout)
+		logs, err := runGAIEProbe(ctx, t, clientset, namespace, gwURL, backend0IP, backend1IP, time.Until(deadline))
 		if err != nil {
 			t.Fatalf("FAIL: endpoint-picker routing probe failed: %v\nLogs:\n%s", err, logs)
 		}
@@ -402,7 +434,14 @@ func buildGAIEEPP(ns, poolName, image string) (*corev1.ServiceAccount, *rbacv1.R
 				Name:  "epp",
 				Image: image,
 				Args:  []string{"--pool-name=" + poolName, "--pool-namespace=" + ns},
-				Ports: []corev1.ContainerPort{{Name: "grpc", ContainerPort: gaieEPPPort}},
+				Ports: []corev1.ContainerPort{
+					{Name: "grpc", ContainerPort: gaieEPPPort},
+					{Name: "health", ContainerPort: gaieEPPHealthPort},
+				},
+				ReadinessProbe: &corev1.Probe{
+					ProbeHandler:  corev1.ProbeHandler{GRPC: &corev1.GRPCAction{Port: gaieEPPHealthPort}},
+					PeriodSeconds: 2,
+				},
 				Resources: corev1.ResourceRequirements{
 					Requests: corev1.ResourceList{
 						corev1.ResourceCPU:    resource.MustParse("50m"),
@@ -415,12 +454,14 @@ func buildGAIEEPP(ns, poolName, image string) (*corev1.ServiceAccount, *rbacv1.R
 		},
 	}
 	eppPort := intstr.FromInt32(gaieEPPPort)
+	appProto := "h2c"
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: gaieEPPName, Namespace: ns},
 		Spec: corev1.ServiceSpec{
 			Selector: map[string]string{"ai-conformance.kubernetes.io/gaie-epp": gaieEPPName},
 			Ports: []corev1.ServicePort{{
-				Name: "grpc", Port: gaieEPPPort, TargetPort: eppPort, Protocol: corev1.ProtocolTCP,
+				Name: "grpc", Port: gaieEPPPort, TargetPort: eppPort,
+				Protocol: corev1.ProtocolTCP, AppProtocol: &appProto,
 			}},
 		},
 	}
@@ -565,7 +606,7 @@ func waitForGAIEHTTPRouteAccepted(ctx context.Context, dyn dynamic.Interface, ns
 // deleteGAIEResourcesAndWait deletes the HTTPRoute, InferencePool, and Gateway
 // and waits for the Gateway to be fully removed. Cloud Gateway controllers may
 // hold finalizers; explicitly deleting before the namespace avoids a race with
-// the 1-minute namespace deletion timeout.
+// the namespace deletion timeout.
 func deleteGAIEResourcesAndWait(ctx context.Context, dyn dynamic.Interface, ns string) error {
 	for _, gvr := range []schema.GroupVersionResource{gaieHTTPRouteGVR, inferencePoolGVR, gaieGatewayGVR} {
 		name := map[schema.GroupVersionResource]string{

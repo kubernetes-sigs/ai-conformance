@@ -14,9 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Installs the Gateway API CRDs and agentgateway for TestGatewayAPIInference
-# and records the matching go test flags. kind has no LoadBalancer, so the
-# GatewayClass provisions ClusterIP Services.
+# Installs the Gateway API CRDs, GAIE CRDs, and agentgateway for
+# TestGatewayAPIInference and TestAdvancedInferenceIngress, and records the
+# matching go test flags. kind has no LoadBalancer, so the GatewayClass
+# provisions ClusterIP Services.
 
 set -o errexit
 set -o nounset
@@ -24,13 +25,18 @@ set -o pipefail
 
 GATEWAY_API_VERSION="${GATEWAY_API_VERSION:-v1.6.3}"
 AGENTGATEWAY_VERSION="${AGENTGATEWAY_VERSION:-v1.7.0}"
+GAIE_VERSION="${GAIE_VERSION:-v1.6.2}"
 GATEWAY_CLASS="agentgateway-clusterip"
 
 echo "Installing Gateway API ${GATEWAY_API_VERSION} CRDs..."
 kubectl apply --server-side --force-conflicts \
     -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/standard-install.yaml"
 
-echo "Installing agentgateway ${AGENTGATEWAY_VERSION}..."
+echo "Installing GAIE ${GAIE_VERSION} CRDs and cluster-scoped resources..."
+kubectl apply --server-side --force-conflicts \
+    -f "https://github.com/kubernetes-sigs/gateway-api-inference-extension/releases/download/${GAIE_VERSION}/manifests.yaml"
+
+echo "Installing agentgateway ${AGENTGATEWAY_VERSION} with inferenceExtension enabled..."
 helm upgrade -i agentgateway-crds oci://cr.agentgateway.dev/charts/agentgateway-crds \
     --version "${AGENTGATEWAY_VERSION}" \
     --namespace agentgateway-system \
@@ -38,6 +44,7 @@ helm upgrade -i agentgateway-crds oci://cr.agentgateway.dev/charts/agentgateway-
 helm upgrade -i agentgateway oci://cr.agentgateway.dev/charts/agentgateway \
     --version "${AGENTGATEWAY_VERSION}" \
     --namespace agentgateway-system \
+    --set inferenceExtension.enabled=true \
     --wait --timeout 10m
 
 kubectl apply -f - <<MANIFEST
@@ -66,3 +73,4 @@ MANIFEST
 kubectl wait --for=condition=Accepted "gatewayclass/${GATEWAY_CLASS}" --timeout=5m
 
 echo "-gateway-api-class=${GATEWAY_CLASS}" >>"${E2E_TEST_ARGS_FILE}"
+echo "-gaie-gateway-class=${GATEWAY_CLASS}" >>"${E2E_TEST_ARGS_FILE}"

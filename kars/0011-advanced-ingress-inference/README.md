@@ -43,14 +43,7 @@ GAIE's [official conformance suite](https://github.com/kubernetes-sigs/gateway-a
 3. Creates a `Gateway`, `InferencePool` (v1), and `HTTPRoute` and waits for them to reach `Accepted`/`Programmed` conditions.
 4. Sends inference requests carrying the `test-epp-endpoint-selection: <podIP>` header through the Gateway and verifies that each request reaches the designated backend Pod, exercising the endpoint-picker routing contract.
 
-The test is **skipped by default**. Run it with:
-
-```bash
-go test -v ./test -run TestAdvancedInferenceIngress -args \
-  -gaie-gateway-class=<gatewayclass-name>
-```
-
-Additional flags: `-gaie-epp-image` (default `registry.k8s.io/gateway-api-inference-extension/lwepp:v1.6.2`), `-gaie-timeout` (default `5m`).
+The test is **skipped by default** when `-gaie-gateway-class` is not set. See [`test/README.md`](../../test/README.md#advanced-inference-ingress) for run instructions and flag details.
 
 ## Implementation History
 

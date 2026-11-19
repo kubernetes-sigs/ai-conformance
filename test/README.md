@@ -131,6 +131,19 @@ By default the test uses the first `Accepted` `GatewayClass` by name and is skip
 go test -v ./test -run TestGatewayAPIInference -timeout 30m -args -gateway-api-class=<class>
 ```
 
+### Advanced Inference Ingress
+
+`TestAdvancedInferenceIngress` (KAR-0011, `spec.networking.advanced_inference_ingress`, SHOULD) requires a GatewayClass backed by a Gateway API Inference Extension (GAIE) implementation, with `inference.networking.k8s.io/v1` and `gateway.networking.k8s.io/v1` CRDs installed. The test deploys two mock inference backend Pods and a lightweight endpoint picker (`lwepp`) wired via `spec.endpointPickerRef`, waits for the `InferencePool` to be `Accepted` by its parent `Gateway` and the `HTTPRoute` to have `Accepted` and `ResolvedRefs`, then verifies that requests carrying `test-epp-endpoint-selection: <podIP>` reach only the designated backend Pod for every request in the batch, exercising the endpoint-picker routing contract.
+
+The test is **skipped by default**. Pass `-gaie-gateway-class` to opt in. Use `-timeout 30m` or larger to cover EPP startup, Gateway provisioning, and cleanup.
+
+```bash
+go test -v ./test -run TestAdvancedInferenceIngress -timeout 30m -args \
+  -gaie-gateway-class=<gatewayclass-name>
+```
+
+Additional flags: `-gaie-epp-image` (default `registry.k8s.io/gateway-api-inference-extension/lwepp:v1.6.2`), `-gaie-timeout` (default `10m`). `run-e2e-gcp.sh` runs this test with agentgateway installed by `test/e2e/setup.d/50-agentgateway.sh`, which enables `inferenceExtension` on the chart and applies the GAIE v1.6.2 manifests.
+
 ### HPA Autoscaling for AI Workloads
 
 `TestHPAAutoscaling` (KAR-0057) verifies that the HorizontalPodAutoscaler scales accelerator-backed Pods on a custom per-Pod metric. It is **skipped by default** and runs when `-hpa-custom-metric-name` is set. A platform that supports the HorizontalPodAutoscaler must be able to scale on custom metrics, so configure the pipeline below and run the test; mark `pod_autoscaling` N/A only if the platform does not support the HorizontalPodAutoscaler at all.
