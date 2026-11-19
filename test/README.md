@@ -131,15 +131,15 @@ go test -v ./test -run TestGatewayAPIInference -timeout 30m -args -gateway-api-c
 
 ### Gang Scheduling
 
-`TestGangScheduling` (KAR-0053, `gang_scheduling`) is not skipped unless `-short` is set. It creates two `batch/v1` Jobs whose Pods each request 100m CPU and 128Mi memory and run the unpinned `busybox` image (there is no flag to override it):
+`TestGangScheduling` is the test for KAR-0053 (`gang_scheduling`), which asks for all-or-nothing scheduling of a Job's Pods. It is not skipped unless `-short` is set. It creates two `batch/v1` Jobs whose Pods each request 100m CPU and 128Mi memory and run the unpinned `busybox` image (there is no flag to override it):
 
 - `PositiveGangScheduling`: a Job with parallelism and completions of 2 must reach `Complete` within 2 minutes.
 - `NegativeGangScheduling`: a Job with parallelism and completions of 1000, 100 CPU and 125Gi in total, must have no Pod bound to a node or `Running` while the test polls for `-gang-negative-window` (default 30s).
 
 The negative case assumes that the gang scheduler cannot start the 1000-Pod Job (KAR-0053: "a cluster with capacity for fewer than N"). The test does not check this. If the gang scheduler admits the whole Job, its first bound Pod fails the test as partial scheduling. Size the environment so that the 2-Pod Job can run and the 1000-Pod Job cannot:
 
-- Kueue: pass `-gang-scheduler-namespace` with a namespace that has a `LocalQueue`, and `-gang-job-labels=kueue.x-k8s.io/queue-name=<LocalQueue>`. The quota the `ClusterQueue` can use, including anything it can borrow, must fit 200m CPU and 256Mi but not 100 CPU and 125Gi together. With Kueue's default configuration and no `default` LocalQueue in the namespace, a Job that has no queue is not managed. If you run the test without these flags, the negative Job's Pods are scheduled as they are created and the test fails.
-- Volcano (`-gang-scheduler-name=volcano`): the test creates a `PodGroup` in queue `default` with `minMember` equal to the Job's parallelism. The `default` queue and the cluster must not be able to run 1000 such Pods.
+- Kueue: pass `-gang-scheduler-namespace` with a namespace that has a `LocalQueue`, and `-gang-job-labels=kueue.x-k8s.io/queue-name=<local-queue>`. The quota the `ClusterQueue` can use, including anything it can borrow, must fit 200m CPU and 256Mi but not 100 CPU and 125Gi together. With Kueue's default configuration and no `default` LocalQueue in the namespace, a Job that has no queue is not managed. If you run the test without these flags, the negative Job's Pods can be scheduled as they are created, and the test fails as soon as it sees one of them bound or running.
+- Volcano (`-gang-scheduler-name=volcano`): the test creates a `PodGroup` in queue `default` with `minMember` equal to the Job's parallelism. The resources available to this Job through queue `default` must not be able to run 1000 such Pods.
 
 The positive case checks that a 2-Pod Job completes. It passes on a cluster that has no gang scheduler, so it does not show that the Job went through one.
 
