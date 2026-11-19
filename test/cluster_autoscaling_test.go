@@ -475,6 +475,9 @@ func verifyPoolIsIdle(
 		if isDaemonOrMirrorPod(pod) {
 			continue
 		}
+		if isPlatformTransientPod(pod, mode, cfg) {
+			continue
+		}
 		if _, inPool := poolNodes[pod.Spec.NodeName]; inPool {
 			foreign = append(foreign, fmt.Sprintf("%s/%s on %s", pod.Namespace, pod.Name, pod.Spec.NodeName))
 			continue
@@ -508,6 +511,52 @@ func isDaemonOrMirrorPod(pod *corev1.Pod) bool {
 	}
 	owner := metav1.GetControllerOf(pod)
 	return owner != nil && owner.Kind == "DaemonSet"
+}
+
+// isPlatformTransientPod returns true for short-lived pods that are part of
+// the accelerator platform stack (e.g. driver validation pods created by the
+// NVIDIA GPU Operator) and should not be treated as foreign workloads by the
+// pool isolation check.
+//
+// These pods share the following characteristics:
+//   - They run in an operator/system namespace (not a user namespace).
+//   - They have RestartPolicy Never or OnFailure, indicating batch semantics.
+//   - They do NOT request any accelerator resources themselves.
+//
+// Without this exemption, transient platform pods such as
+// nvidia-cuda-validator (created by the GPU Operator's ClusterPolicy
+// controller after a node joins) cause verifyPoolIsIdle to report a false
+// "foreign workload" error, because they are not owned by a DaemonSet.
+func isPlatformTransientPod(pod *corev1.Pod, mode string, cfg AcceleratorConfig) bool {
+	if !isPlatformNamespace(pod.Namespace) {
+		return false
+	}
+	// An unset RestartPolicy is defaulted to Always by the API server, so only
+	// an explicit batch policy qualifies as transient.
+	if pod.Spec.RestartPolicy != corev1.RestartPolicyNever &&
+		pod.Spec.RestartPolicy != corev1.RestartPolicyOnFailure {
+		return false
+	}
+	return !podRequestsAccelerator(pod, mode, cfg)
+}
+
+// platformNamespacePrefixes identify namespaces owned by the cluster platform
+// or by an accelerator vendor's operator, rather than by users. Pods in user
+// namespaces are never exempt from the pool isolation check.
+var platformNamespacePrefixes = []string{
+	"kube-",
+	"openshift-",
+	"gpu-operator",
+	"nvidia-",
+}
+
+func isPlatformNamespace(namespace string) bool {
+	for _, prefix := range platformNamespacePrefixes {
+		if strings.HasPrefix(namespace, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func podRequestsAccelerator(pod *corev1.Pod, mode string, cfg AcceleratorConfig) bool {
