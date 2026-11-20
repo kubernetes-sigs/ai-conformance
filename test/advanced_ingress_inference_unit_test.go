@@ -227,4 +227,3 @@ func nestedMap(obj map[string]any, key string) (map[string]any, bool, error) {
 	m, ok := v.(map[string]any)
 	return m, ok, nil
 }
-
