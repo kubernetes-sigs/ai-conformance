@@ -176,8 +176,8 @@ func TestBuildGAIEEPP(t *testing.T) {
 	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != gaieEPPPort {
 		t.Errorf("EPP service port: got %v, want %d", svc.Spec.Ports, gaieEPPPort)
 	}
-	if svc.Spec.Ports[0].AppProtocol == nil || *svc.Spec.Ports[0].AppProtocol != "h2c" {
-		t.Errorf("EPP service AppProtocol: got %v, want h2c", svc.Spec.Ports[0].AppProtocol)
+	if svc.Spec.Ports[0].AppProtocol == nil || *svc.Spec.Ports[0].AppProtocol != "http2" {
+		t.Errorf("EPP service AppProtocol: got %v, want http2", svc.Spec.Ports[0].AppProtocol)
 	}
 	epp := pod.Spec.Containers[0]
 	if epp.ReadinessProbe == nil || epp.ReadinessProbe.GRPC == nil {

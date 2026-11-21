@@ -454,7 +454,7 @@ func buildGAIEEPP(ns, poolName, image string) (*corev1.ServiceAccount, *rbacv1.R
 		},
 	}
 	eppPort := intstr.FromInt32(gaieEPPPort)
-	appProto := "h2c"
+	appProto := "http2"
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: gaieEPPName, Namespace: ns},
 		Spec: corev1.ServiceSpec{
